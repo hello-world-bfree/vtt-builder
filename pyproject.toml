@@ -1,0 +1,23 @@
+[project]
+name = "vtt-builder"
+version = "0.1.0"
+description = "Simple and fast functions for building WebVTT formatted transcripts."
+authors = [
+    { name = "hello-world-bfree", email = "hello-world-bfree@proton.me" }
+]
+dependencies = []
+readme = "README.md"
+requires-python = ">= 3.8"
+
+[build-system]
+requires = ["maturin>=1.2,<2.0"]
+build-backend = "maturin"
+
+[tool.rye]
+managed = true
+dev-dependencies = []
+
+[tool.maturin]
+python-source = "python"
+module-name = "vtt_builder._lowlevel"
+features = ["pyo3/extension-module"]
