@@ -1,6 +1,6 @@
 [project]
 name = "vtt-builder"
-version = "0.2.0"
+version = "0.2.1"
 description = "Simple and fast functions for building WebVTT formatted transcripts."
 authors = [
     { name = "hello-world-bfree", email = "hello-world-bfree@proton.me" }

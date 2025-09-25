@@ -36,6 +36,18 @@ def sample_transcript_data_2():
 
 
 @pytest.fixture
+def sample_transcript_data_3():
+    """Second sample for multi-file tests."""
+    return {
+        "transcript": "Third transcript file.",
+        "segments": [
+            {"id": 3, "start": 0.0, "end": 1.5, "text": "Third\n\n\n transcript"},
+            {"id": 4, "start": 1.5, "end": 3.0, "text": "file"},
+        ],
+    }
+
+
+@pytest.fixture
 def temp_json_file(sample_transcript_data):
     """Create a temporary JSON file with sample data."""
     with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
@@ -199,7 +211,12 @@ class TestVTTBuilder:
     def test_build_vtt_from_records_text_cleaning(self, temp_output_file):
         """Test that newlines in text are properly handled."""
         segments = [
-            {"id": 1, "start": 0.0, "end": 2.0, "text": "Text with\nnewlines\nhere"},
+            {
+                "id": 1,
+                "start": 0.0,
+                "end": 2.0,
+                "text": "Text with\n\n\nnewlines\nhere",
+            },
             {"id": 2, "start": 2.0, "end": 4.0, "text": "  Whitespace text  "},
         ]
 
@@ -297,7 +314,7 @@ Hello world
         with pytest.raises(Exception):  # Should raise ValueError
             validate_vtt_file(temp_output_file)
 
-    def test_validate_vtt_file_wrong_header(self, temp_output_file):
+    def test_validate_vtt_file_split_cue(self, temp_output_file):
         """Test validation fails for incorrect header."""
         invalid_vtt = """WEBVTT
 

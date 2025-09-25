@@ -49,7 +49,14 @@ fn write_segments_to_vtt<W: Write>(
     for segment in segments {
         let start_time = format_timestamp(segment.start + offset);
         let end_time = format_timestamp(segment.end + offset);
-        let clean_text = segment.text.replace("\n", " ").trim().to_string();
+        let clean_text = segment
+            .text
+            .replace("\n", " ")
+            .replace('\r', " ")
+            .replace('\t', " ")
+            .split_whitespace()
+            .collect::<Vec<&str>>()
+            .join(" ");
         writeln!(
             output,
             "{}\n{} --> {}\n{}\n",
