@@ -76,7 +76,7 @@ fn write_segments_to_vtt<W: Write>(
 
 /// Builds a VTT file from a list of JSON files.
 #[pyfunction]
-fn build_vtt_from_json_files(file_paths: Vec<&str>, output_file: &str) -> PyResult<()> {
+fn build_vtt_from_json_files(file_paths: Vec<String>, output_file: &str) -> PyResult<()> {
     let mut output = File::create(output_file).map_err(map_io_error)?;
     writeln!(output, "WEBVTT\n").map_err(map_io_error)?;
 
@@ -84,7 +84,7 @@ fn build_vtt_from_json_files(file_paths: Vec<&str>, output_file: &str) -> PyResu
     let mut current_index = 1;
 
     for file_path in file_paths {
-        let file = File::open(file_path).map_err(map_io_error)?;
+        let file = File::open(&file_path).map_err(map_io_error)?;
         let reader = BufReader::new(file);
         let transcript: Transcript = serde_json::from_reader(reader)
             .map_err(|e| pyo3::exceptions::PyValueError::new_err(e.to_string()))?;
@@ -105,7 +105,7 @@ fn build_vtt_from_json_files(file_paths: Vec<&str>, output_file: &str) -> PyResu
 }
 
 #[pyfunction]
-fn build_transcript_from_json_files(file_paths: Vec<&str>, output_file: &str) -> PyResult<()> {
+fn build_transcript_from_json_files(file_paths: Vec<String>, output_file: &str) -> PyResult<()> {
     let mut output = File::create(output_file).map_err(map_io_error)?;
 
     for (index, file_path) in file_paths.iter().enumerate() {
@@ -126,7 +126,7 @@ fn build_transcript_from_json_files(file_paths: Vec<&str>, output_file: &str) ->
 
 /// Builds a VTT file from a list of Python dictionaries representing segments.
 #[pyfunction]
-fn build_vtt_from_records(_py: Python, segments_list: &PyList, output_file: &str) -> PyResult<()> {
+fn build_vtt_from_records(segments_list: &Bound<'_, PyList>, output_file: &str) -> PyResult<()> {
     let mut output = File::create(output_file).map_err(map_io_error)?;
     writeln!(output, "WEBVTT\n").map_err(map_io_error)?;
 
@@ -136,19 +136,19 @@ fn build_vtt_from_records(_py: Python, segments_list: &PyList, output_file: &str
         let segment_dict = segment.downcast::<PyDict>()?;
 
         let id: u32 = segment_dict
-            .get_item("id")
+            .get_item("id")?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'id' field"))?
             .extract()?;
         let start: f64 = segment_dict
-            .get_item("start")
+            .get_item("start")?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
             .extract()?;
         let end: f64 = segment_dict
-            .get_item("end")
+            .get_item("end")?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
             .extract()?;
         let text: String = segment_dict
-            .get_item("text")
+            .get_item("text")?
             .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
             .extract()?;
 
@@ -295,7 +295,7 @@ fn is_valid_timestamp(timestamp: &str) -> bool {
 }
 
 #[pymodule]
-fn _lowlevel(_py: Python, m: &PyModule) -> PyResult<()> {
+fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_transcript_from_json_files, m)?)?;
     m.add_function(wrap_pyfunction!(build_vtt_from_json_files, m)?)?;
     m.add_function(wrap_pyfunction!(build_vtt_from_records, m)?)?;
