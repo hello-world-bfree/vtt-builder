@@ -773,6 +773,144 @@ print(f"Words per second: {stats['words_per_second']:.2f}")  # 1.20
 
 ---
 
+## Podcast Processing Functions
+
+### `remove_filler_words`
+
+Remove common verbal fillers from transcriptions.
+
+```python
+def remove_filler_words(
+    segments_list: list[dict],
+    fillers: list[str] = None,
+    preserve_timing: bool = True
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | List of segment dictionaries |
+| `fillers` | `list[str]` | `None` | Custom filler words (uses defaults if None) |
+| `preserve_timing` | `bool` | `True` | Keep original timing even for empty segments |
+
+**Default Fillers:** um, uh, uhh, umm, er, err, ah, ahh, eh, like, you know, i mean, sort of, kind of, basically, actually, literally, right, okay so, so like
+
+---
+
+### `group_by_speaker`
+
+Group segments by speaker for diarized transcriptions.
+
+```python
+def group_by_speaker(
+    segments_list: list[dict],
+    max_gap: float = 2.0,
+    format_speaker: bool = True
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | Segments with 'speaker' field |
+| `max_gap` | `float` | `2.0` | Max gap to merge same-speaker segments |
+| `format_speaker` | `bool` | `True` | Add WebVTT voice tag (`<v Speaker>`) |
+
+---
+
+### `filter_by_confidence`
+
+Filter segments by transcription confidence scores.
+
+```python
+def filter_by_confidence(
+    segments_list: list[dict],
+    min_confidence: float = 0.8,
+    remove_or_mark: str = "remove"
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | Segments with optional 'confidence' field |
+| `min_confidence` | `float` | `0.8` | Minimum confidence threshold (0.0-1.0) |
+| `remove_or_mark` | `str` | `"remove"` | "remove" or "mark" low-confidence segments |
+
+---
+
+### `words_to_segments`
+
+Aggregate word-level timestamps into sentence-like segments.
+
+```python
+def words_to_segments(
+    words_list: list[dict],
+    max_segment_duration: float = 10.0,
+    pause_threshold: float = 1.0
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `words_list` | `list[dict]` | (required) | Word dicts with 'word'/'text', 'start', 'end' |
+| `max_segment_duration` | `float` | `10.0` | Max segment duration in seconds |
+| `pause_threshold` | `float` | `1.0` | Pause that forces segment break (seconds) |
+
+---
+
+### `remove_repeated_phrases`
+
+Remove stuttering and repeated phrases.
+
+```python
+def remove_repeated_phrases(
+    segments_list: list[dict],
+    min_repetitions: int = 2,
+    max_phrase_words: int = 5
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | List of segment dictionaries |
+| `min_repetitions` | `int` | `2` | Minimum consecutive repetitions to remove |
+| `max_phrase_words` | `int` | `5` | Max words in phrase to check |
+
+---
+
+### `detect_chapters`
+
+Automatically detect chapter breaks based on silence.
+
+```python
+def detect_chapters(
+    segments_list: list[dict],
+    min_chapter_duration: float = 60.0,
+    silence_threshold: float = 3.0
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | List of segment dictionaries |
+| `min_chapter_duration` | `float` | `60.0` | Minimum chapter duration (seconds) |
+| `silence_threshold` | `float` | `3.0` | Silence duration indicating chapter break |
+
+**Returns:** List of chapter markers with `chapter`, `start`, and `timestamp` fields.
+
+---
+
 ## Exception Types
 
 ### Exception Hierarchy
@@ -1099,7 +1237,17 @@ def build_safe_vtt(segments, output_path):
 
 ## Version History
 
-- **0.4.0** (Current)
+- **0.5.0** (Current)
+  - Added podcast processing functions for transcription cleanup
+  - Added `remove_filler_words()` to remove verbal fillers (um, uh, like, etc.)
+  - Added `group_by_speaker()` for speaker diarization with WebVTT voice tags
+  - Added `filter_by_confidence()` for confidence-based segment filtering
+  - Added `words_to_segments()` for word-level to segment aggregation
+  - Added `remove_repeated_phrases()` for stuttering/repetition removal
+  - Added `detect_chapters()` for automatic chapter marker detection
+  - Enhanced test coverage (149 tests)
+
+- **0.4.0**
   - Added `build_vtt_string()` for in-memory VTT generation
   - Added `merge_segments()` for combining adjacent segments
   - Added `split_long_segments()` for breaking up long cues

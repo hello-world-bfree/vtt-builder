@@ -12,6 +12,7 @@ High-performance WebVTT file generation with spec compliance, powered by Rust.
 - **Robust**: Comprehensive error handling with specific exception types
 - **Versatile**: Rich set of transformation utilities (merge, split, shift, filter)
 - **Insightful**: Built-in statistics and analysis functions
+- **Podcast Ready**: Specialized functions for podcast transcription processing (filler removal, speaker diarization, confidence filtering, chapter detection)
 
 ## Installation
 
@@ -416,6 +417,148 @@ vtt_content = build_vtt_string(segments)
 # Returns WebVTT string without writing to disk
 ```
 
+## Podcast Transcription Processing
+
+VTT Builder is optimized for processing podcast transcriptions from services like Deepgram, OpenAI Whisper, and AssemblyAI.
+
+### Remove Filler Words
+
+Clean up transcriptions by removing verbal fillers:
+
+```python
+from vtt_builder import remove_filler_words
+
+segments = [
+    {"start": 0.0, "end": 2.0, "text": "Um so basically I think"},
+    {"start": 2.0, "end": 4.0, "text": "You know like it's actually good"},
+]
+
+cleaned = remove_filler_words(segments)
+# [{"text": "so I think", ...},
+#  {"text": "it's good", ...}]
+
+# Custom fillers
+custom = remove_filler_words(segments, fillers=["well", "right", "okay"])
+```
+
+### Speaker Diarization
+
+Group segments by speaker with WebVTT voice tags:
+
+```python
+from vtt_builder import group_by_speaker
+
+segments = [
+    {"start": 0.0, "end": 1.0, "text": "Hello", "speaker": "Alice"},
+    {"start": 1.0, "end": 2.0, "text": "world", "speaker": "Alice"},
+    {"start": 2.0, "end": 3.0, "text": "Hi there", "speaker": "Bob"},
+]
+
+grouped = group_by_speaker(segments)
+# [{"text": "<v Alice>Hello world", "speaker": "Alice", ...},
+#  {"text": "<v Bob>Hi there", "speaker": "Bob", ...}]
+```
+
+### Confidence Filtering
+
+Filter out low-confidence transcription segments:
+
+```python
+from vtt_builder import filter_by_confidence
+
+segments = [
+    {"start": 0.0, "end": 2.0, "text": "Clear speech", "confidence": 0.95},
+    {"start": 2.0, "end": 4.0, "text": "Mumbled", "confidence": 0.4},
+]
+
+# Remove low confidence segments
+filtered = filter_by_confidence(segments, min_confidence=0.8)
+# Only keeps "Clear speech"
+
+# Or mark them for review
+marked = filter_by_confidence(segments, min_confidence=0.8, remove_or_mark="mark")
+# Adds "low_confidence": True flag
+```
+
+### Word-Level to Segment Aggregation
+
+Convert word-level timestamps to sentence-like segments:
+
+```python
+from vtt_builder import words_to_segments
+
+# Output from Deepgram/Whisper word-level API
+words = [
+    {"word": "Hello", "start": 0.0, "end": 0.5},
+    {"word": "world.", "start": 0.6, "end": 1.0},
+    {"word": "How", "start": 1.5, "end": 1.8},
+    {"word": "are", "start": 1.9, "end": 2.1},
+    {"word": "you?", "start": 2.2, "end": 2.5},
+]
+
+segments = words_to_segments(words, max_segment_duration=10.0, pause_threshold=1.0)
+# Groups words into segments based on punctuation and pauses
+```
+
+### Remove Repeated Phrases
+
+Clean up stuttering and repetitions:
+
+```python
+from vtt_builder import remove_repeated_phrases
+
+segments = [
+    {"start": 0.0, "end": 2.0, "text": "I think I think I think it's good"},
+]
+
+cleaned = remove_repeated_phrases(segments)
+# [{"text": "I think it's good", ...}]
+```
+
+### Automatic Chapter Detection
+
+Detect chapter breaks based on pauses:
+
+```python
+from vtt_builder import detect_chapters
+
+segments = [
+    {"start": 0.0, "end": 60.0, "text": "Introduction..."},
+    {"start": 61.0, "end": 180.0, "text": "Main topic..."},
+    {"start": 190.0, "end": 300.0, "text": "Different topic..."},  # 10s gap
+]
+
+chapters = detect_chapters(segments, min_chapter_duration=60.0, silence_threshold=5.0)
+# [{"chapter": 1, "start": 0.0, "timestamp": "00:00"},
+#  {"chapter": 2, "start": 190.0, "timestamp": "03:10"}]
+```
+
+### Complete Podcast Processing Pipeline
+
+```python
+from vtt_builder import (
+    words_to_segments,
+    remove_filler_words,
+    remove_repeated_phrases,
+    filter_by_confidence,
+    group_by_speaker,
+    build_vtt_from_records,
+)
+
+# Raw transcription from API
+raw_words = api_response["words"]
+
+# Process pipeline
+segments = words_to_segments(raw_words)
+segments = remove_filler_words(segments)
+segments = remove_repeated_phrases(segments)
+segments = filter_by_confidence(segments, min_confidence=0.7)
+segments = group_by_speaker(segments, format_speaker=True)
+
+# Generate clean VTT
+build_vtt_from_records(segments, "podcast_episode.vtt")
+```
+
 ## Documentation
 
 - [API Reference](docs/API.md) - Complete function documentation
@@ -446,6 +589,7 @@ MIT
 
 ## Version History
 
+- **0.5.0** - Podcast processing: filler removal, speaker diarization, confidence filtering, word aggregation, chapter detection
 - **0.4.0** - Transformation utilities: merge, split, shift, filter, stats, in-memory building
 - **0.3.0** - WebVTT spec compliance: character escaping, input validation, custom exceptions
 - **0.2.1** - Handle multiple newlines, tabs, carriage returns

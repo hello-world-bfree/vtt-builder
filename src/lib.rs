@@ -1405,6 +1405,618 @@ fn filter_segments_by_time(
     Ok(result.into())
 }
 
+// ============================================================================
+// Podcast Processing Functions
+// ============================================================================
+
+/// Removes common filler words from segment text.
+///
+/// Useful for cleaning up podcast transcriptions where speakers use verbal
+/// fillers like "um", "uh", "like", "you know", etc.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `fillers` - Optional list of filler words to remove (uses defaults if not provided)
+/// * `preserve_timing` - If true, removes fillers but keeps original timing
+///
+/// # Returns
+/// * List of segments with filler words removed
+#[pyfunction]
+#[pyo3(signature = (segments_list, fillers=None, preserve_timing=true))]
+fn remove_filler_words(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    fillers: Option<Vec<String>>,
+    preserve_timing: bool,
+) -> PyResult<Py<PyList>> {
+    let default_fillers = vec![
+        "um", "uh", "uhh", "umm", "er", "err", "ah", "ahh", "eh", "like", "you know", "i mean",
+        "sort of", "kind of", "basically", "actually", "literally", "right", "okay so", "so like",
+    ];
+
+    let filler_list: Vec<String> = fillers.unwrap_or_else(|| {
+        default_fillers
+            .iter()
+            .map(|s| s.to_string())
+            .collect()
+    });
+
+    let result = PyList::empty(py);
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let id: u32 = segment_dict
+            .get_item("id")?
+            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+            .unwrap_or((idx + 1) as u32);
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        // Remove filler words (case-insensitive)
+        let mut cleaned_text = text.clone();
+        for filler in &filler_list {
+            // Match filler as whole word with word boundaries
+            let pattern = format!(r"(?i)\b{}\b", regex::escape(filler));
+            if let Ok(re) = regex::Regex::new(&pattern) {
+                cleaned_text = re.replace_all(&cleaned_text, "").to_string();
+            }
+        }
+
+        // Clean up multiple spaces
+        let cleaned_text = cleaned_text.split_whitespace().collect::<Vec<_>>().join(" ");
+
+        // Skip empty segments unless preserving timing
+        if cleaned_text.is_empty() && !preserve_timing {
+            continue;
+        }
+
+        let dict = PyDict::new(py);
+        dict.set_item("id", if preserve_timing { id } else { (result.len() + 1) as u32 })?;
+        dict.set_item("start", start)?;
+        dict.set_item("end", end)?;
+        dict.set_item("text", cleaned_text)?;
+
+        // Preserve speaker info if present
+        if let Ok(Some(speaker)) = segment_dict.get_item("speaker") {
+            dict.set_item("speaker", speaker)?;
+        }
+
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Groups segments by speaker for podcast transcriptions with speaker diarization.
+///
+/// Takes segments with speaker labels and groups consecutive segments by the same
+/// speaker into single cues.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries with 'speaker' field
+/// * `max_gap` - Maximum gap (seconds) to merge same-speaker segments (default 2.0)
+/// * `format_speaker` - If true, prepends speaker name to text (default true)
+///
+/// # Returns
+/// * List of grouped segments with speaker information
+#[pyfunction]
+#[pyo3(signature = (segments_list, max_gap=2.0, format_speaker=true))]
+fn group_by_speaker(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    max_gap: f64,
+    format_speaker: bool,
+) -> PyResult<Py<PyList>> {
+    if segments_list.is_empty() {
+        return Ok(PyList::empty(py).into());
+    }
+
+    let result = PyList::empty(py);
+    let mut current_speaker: Option<String> = None;
+    let mut current_start = 0.0f64;
+    let mut current_end = 0.0f64;
+    let mut current_texts: Vec<String> = vec![];
+
+    for segment in segments_list.iter() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        let speaker: String = segment_dict
+            .get_item("speaker")?
+            .map(|v| v.extract().unwrap_or_else(|_| "Unknown".to_string()))
+            .unwrap_or_else(|| "Unknown".to_string());
+
+        let should_merge = current_speaker.as_ref() == Some(&speaker)
+            && (start - current_end) <= max_gap;
+
+        if should_merge {
+            // Continue accumulating for same speaker
+            current_end = end;
+            current_texts.push(text);
+        } else {
+            // Output previous speaker's segment (if any)
+            if !current_texts.is_empty() {
+                let dict = PyDict::new(py);
+                dict.set_item("id", (result.len() + 1) as u32)?;
+                dict.set_item("start", current_start)?;
+                dict.set_item("end", current_end)?;
+
+                let combined_text = current_texts.join(" ");
+                if format_speaker {
+                    if let Some(ref spk) = current_speaker {
+                        dict.set_item("text", format!("<v {}>{}", spk, combined_text))?;
+                    } else {
+                        dict.set_item("text", combined_text)?;
+                    }
+                } else {
+                    dict.set_item("text", combined_text)?;
+                }
+
+                if let Some(ref spk) = current_speaker {
+                    dict.set_item("speaker", spk.clone())?;
+                }
+
+                result.append(dict)?;
+            }
+
+            // Start new speaker segment
+            current_speaker = Some(speaker);
+            current_start = start;
+            current_end = end;
+            current_texts = vec![text];
+        }
+    }
+
+    // Output final segment
+    if !current_texts.is_empty() {
+        let dict = PyDict::new(py);
+        dict.set_item("id", (result.len() + 1) as u32)?;
+        dict.set_item("start", current_start)?;
+        dict.set_item("end", current_end)?;
+
+        let combined_text = current_texts.join(" ");
+        if format_speaker {
+            if let Some(ref spk) = current_speaker {
+                dict.set_item("text", format!("<v {}>{}", spk, combined_text))?;
+            } else {
+                dict.set_item("text", combined_text)?;
+            }
+        } else {
+            dict.set_item("text", combined_text)?;
+        }
+
+        if let Some(ref spk) = current_speaker {
+            dict.set_item("speaker", spk.clone())?;
+        }
+
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Filters segments based on confidence scores.
+///
+/// Useful for cleaning up transcriptions by removing low-confidence segments
+/// that are likely to contain errors.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries with optional 'confidence' field
+/// * `min_confidence` - Minimum confidence threshold (0.0 to 1.0, default 0.8)
+/// * `remove_or_mark` - "remove" to delete low-confidence segments, "mark" to add flag
+///
+/// # Returns
+/// * List of segments meeting confidence threshold
+#[pyfunction]
+#[pyo3(signature = (segments_list, min_confidence=0.8, remove_or_mark="remove"))]
+fn filter_by_confidence(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    min_confidence: f64,
+    remove_or_mark: &str,
+) -> PyResult<Py<PyList>> {
+    let result = PyList::empty(py);
+    let should_remove = remove_or_mark == "remove";
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let confidence: f64 = segment_dict
+            .get_item("confidence")?
+            .map(|v| v.extract().unwrap_or(1.0))
+            .unwrap_or(1.0); // Assume high confidence if not provided
+
+        let id: u32 = segment_dict
+            .get_item("id")?
+            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+            .unwrap_or((idx + 1) as u32);
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        if should_remove && confidence < min_confidence {
+            continue;
+        }
+
+        let dict = PyDict::new(py);
+        dict.set_item("id", if should_remove { (result.len() + 1) as u32 } else { id })?;
+        dict.set_item("start", start)?;
+        dict.set_item("end", end)?;
+        dict.set_item("text", text)?;
+        dict.set_item("confidence", confidence)?;
+
+        if !should_remove && confidence < min_confidence {
+            dict.set_item("low_confidence", true)?;
+        }
+
+        // Preserve speaker info if present
+        if let Ok(Some(speaker)) = segment_dict.get_item("speaker") {
+            dict.set_item("speaker", speaker)?;
+        }
+
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Aggregates word-level timing data into sentence-like segments.
+///
+/// Many transcription APIs return word-level timestamps. This function groups
+/// words into natural sentence boundaries based on punctuation and pauses.
+///
+/// # Arguments
+/// * `words_list` - List of word dictionaries with 'word', 'start', 'end' fields
+/// * `max_segment_duration` - Maximum duration for a single segment (default 10.0s)
+/// * `pause_threshold` - Pause duration that forces segment break (default 1.0s)
+///
+/// # Returns
+/// * List of segment dictionaries
+#[pyfunction]
+#[pyo3(signature = (words_list, max_segment_duration=10.0, pause_threshold=1.0))]
+fn words_to_segments(
+    py: Python<'_>,
+    words_list: &Bound<'_, PyList>,
+    max_segment_duration: f64,
+    pause_threshold: f64,
+) -> PyResult<Py<PyList>> {
+    if words_list.is_empty() {
+        return Ok(PyList::empty(py).into());
+    }
+
+    let result = PyList::empty(py);
+    let mut segment_words: Vec<String> = vec![];
+    let mut segment_start = 0.0f64;
+    let mut segment_end = 0.0f64;
+    let mut last_end = 0.0f64;
+
+    for word_item in words_list.iter() {
+        let word_dict = word_item.downcast::<PyDict>()?;
+
+        let word: String = word_dict
+            .get_item("word")?
+            .or_else(|| word_dict.get_item("text").ok().flatten())
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'word' or 'text' field"))?
+            .extract()?;
+
+        let word_start: f64 = word_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let word_end: f64 = word_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let pause = if segment_words.is_empty() {
+            0.0
+        } else {
+            word_start - last_end
+        };
+
+        let current_duration = if segment_words.is_empty() {
+            0.0
+        } else {
+            word_end - segment_start
+        };
+
+        // Check if we should start a new segment
+        let should_break = !segment_words.is_empty()
+            && (pause >= pause_threshold
+                || current_duration > max_segment_duration
+                || word.ends_with('.')
+                || word.ends_with('?')
+                || word.ends_with('!'));
+
+        // If the last word had sentence-ending punctuation, break after it
+        let last_word_ends_sentence = segment_words
+            .last()
+            .map(|w| w.ends_with('.') || w.ends_with('?') || w.ends_with('!'))
+            .unwrap_or(false);
+
+        if should_break || (last_word_ends_sentence && !segment_words.is_empty()) {
+            // Save current segment
+            let dict = PyDict::new(py);
+            dict.set_item("id", (result.len() + 1) as u32)?;
+            dict.set_item("start", segment_start)?;
+            dict.set_item("end", segment_end)?;
+            dict.set_item("text", segment_words.join(" "))?;
+            result.append(dict)?;
+
+            // Start new segment
+            segment_words = vec![word];
+            segment_start = word_start;
+            segment_end = word_end;
+        } else if segment_words.is_empty() {
+            // First word
+            segment_words.push(word);
+            segment_start = word_start;
+            segment_end = word_end;
+        } else {
+            // Continue current segment
+            segment_words.push(word);
+            segment_end = word_end;
+        }
+
+        last_end = word_end;
+    }
+
+    // Output final segment
+    if !segment_words.is_empty() {
+        let dict = PyDict::new(py);
+        dict.set_item("id", (result.len() + 1) as u32)?;
+        dict.set_item("start", segment_start)?;
+        dict.set_item("end", segment_end)?;
+        dict.set_item("text", segment_words.join(" "))?;
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Detects and removes repeated phrases that often occur in podcast transcriptions.
+///
+/// When speakers stutter or repeat themselves, transcription services may include
+/// duplicate phrases. This function identifies and removes such repetitions.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `min_repetitions` - Minimum number of immediate repetitions to detect (default 2)
+/// * `max_phrase_words` - Maximum words in a phrase to check for repetition (default 5)
+///
+/// # Returns
+/// * List of segments with repeated phrases removed
+#[pyfunction]
+#[pyo3(signature = (segments_list, min_repetitions=2, max_phrase_words=5))]
+fn remove_repeated_phrases(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    min_repetitions: usize,
+    max_phrase_words: usize,
+) -> PyResult<Py<PyList>> {
+    let result = PyList::empty(py);
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let id: u32 = segment_dict
+            .get_item("id")?
+            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+            .unwrap_or((idx + 1) as u32);
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        // Remove repeated phrases
+        let words: Vec<&str> = text.split_whitespace().collect();
+        let mut cleaned_words: Vec<String> = vec![];
+        let mut i = 0;
+
+        while i < words.len() {
+            let mut found_repetition = false;
+
+            // Check for repeated phrases of different lengths
+            for phrase_len in (1..=max_phrase_words).rev() {
+                if i + phrase_len * min_repetitions > words.len() {
+                    continue;
+                }
+
+                let phrase: Vec<&str> = words[i..i + phrase_len].to_vec();
+                let mut repetition_count = 1;
+
+                // Count consecutive repetitions
+                let mut j = i + phrase_len;
+                while j + phrase_len <= words.len() {
+                    let next_phrase: Vec<&str> = words[j..j + phrase_len].to_vec();
+                    if phrase
+                        .iter()
+                        .zip(next_phrase.iter())
+                        .all(|(a, b)| a.to_lowercase() == b.to_lowercase())
+                    {
+                        repetition_count += 1;
+                        j += phrase_len;
+                    } else {
+                        break;
+                    }
+                }
+
+                if repetition_count >= min_repetitions {
+                    // Keep only one instance of the repeated phrase
+                    for word in phrase {
+                        cleaned_words.push(word.to_string());
+                    }
+                    i = j;
+                    found_repetition = true;
+                    break;
+                }
+            }
+
+            if !found_repetition {
+                cleaned_words.push(words[i].to_string());
+                i += 1;
+            }
+        }
+
+        let dict = PyDict::new(py);
+        dict.set_item("id", id)?;
+        dict.set_item("start", start)?;
+        dict.set_item("end", end)?;
+        dict.set_item("text", cleaned_words.join(" "))?;
+
+        // Preserve speaker info if present
+        if let Ok(Some(speaker)) = segment_dict.get_item("speaker") {
+            dict.set_item("speaker", speaker)?;
+        }
+
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Adds chapter markers/timestamps for podcast navigation.
+///
+/// Identifies potential chapter breaks based on long pauses, topic changes,
+/// or explicit markers in the text.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `min_chapter_duration` - Minimum duration for a chapter (default 60.0s)
+/// * `silence_threshold` - Gap duration that indicates chapter break (default 3.0s)
+///
+/// # Returns
+/// * List of chapter markers with timestamps
+#[pyfunction]
+#[pyo3(signature = (segments_list, min_chapter_duration=60.0, silence_threshold=3.0))]
+fn detect_chapters(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    min_chapter_duration: f64,
+    silence_threshold: f64,
+) -> PyResult<Py<PyList>> {
+    if segments_list.is_empty() {
+        return Ok(PyList::empty(py).into());
+    }
+
+    let result = PyList::empty(py);
+
+    // First chapter always starts at the beginning
+    let first_item = segments_list.get_item(0)?;
+    let first_segment = first_item.downcast::<PyDict>()?;
+    let first_start: f64 = first_segment
+        .get_item("start")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+        .extract()?;
+
+    let mut chapter_start = first_start;
+    let mut last_end = first_start;
+
+    let dict = PyDict::new(py);
+    dict.set_item("chapter", 1)?;
+    dict.set_item("start", chapter_start)?;
+    dict.set_item("timestamp", format_timestamp_internal(chapter_start))?;
+    result.append(dict)?;
+
+    for i in 1..segments_list.len() {
+        let seg_item = segments_list.get_item(i)?;
+        let segment = seg_item.downcast::<PyDict>()?;
+
+        let seg_start: f64 = segment
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let seg_end: f64 = segment
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let gap = seg_start - last_end;
+        let chapter_duration = seg_start - chapter_start;
+
+        // Check for chapter break
+        if gap >= silence_threshold && chapter_duration >= min_chapter_duration {
+            let dict = PyDict::new(py);
+            dict.set_item("chapter", result.len() + 1)?;
+            dict.set_item("start", seg_start)?;
+            dict.set_item("timestamp", format_timestamp_internal(seg_start))?;
+            result.append(dict)?;
+
+            chapter_start = seg_start;
+        }
+
+        last_end = seg_end;
+    }
+
+    Ok(result.into())
+}
+
+/// Formats timestamps for display (helper function)
+fn format_timestamp_internal(seconds: f64) -> String {
+    let hours = (seconds / 3600.0).floor() as u32;
+    let mins = ((seconds % 3600.0) / 60.0).floor() as u32;
+    let secs = (seconds % 60.0).floor() as u32;
+
+    if hours > 0 {
+        format!("{:02}:{:02}:{:02}", hours, mins, secs)
+    } else {
+        format!("{:02}:{:02}", mins, secs)
+    }
+}
+
 #[pymodule]
 fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add custom exception types for better error handling in Python
@@ -1441,6 +2053,14 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Add statistics functions
     m.add_function(wrap_pyfunction!(get_segments_stats, m)?)?;
+
+    // Add podcast processing functions
+    m.add_function(wrap_pyfunction!(remove_filler_words, m)?)?;
+    m.add_function(wrap_pyfunction!(group_by_speaker, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_by_confidence, m)?)?;
+    m.add_function(wrap_pyfunction!(words_to_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(remove_repeated_phrases, m)?)?;
+    m.add_function(wrap_pyfunction!(detect_chapters, m)?)?;
 
     Ok(())
 }

@@ -27,6 +27,13 @@ from vtt_builder._lowlevel import (
     timestamp_to_seconds,
     # Statistics functions
     get_segments_stats,
+    # Podcast processing functions
+    remove_filler_words,
+    group_by_speaker,
+    filter_by_confidence,
+    words_to_segments,
+    remove_repeated_phrases,
+    detect_chapters,
     # Exception types
     VttError,
     VttValidationError,
@@ -36,7 +43,7 @@ from vtt_builder._lowlevel import (
     VttEscapingError,
 )
 
-__version__ = "0.4.0"
+__version__ = "0.5.0"
 
 __all__ = [
     # Builder functions
@@ -60,6 +67,13 @@ __all__ = [
     "timestamp_to_seconds",
     # Statistics
     "get_segments_stats",
+    # Podcast processing
+    "remove_filler_words",
+    "group_by_speaker",
+    "filter_by_confidence",
+    "words_to_segments",
+    "remove_repeated_phrases",
+    "detect_chapters",
     # Exceptions
     "VttError",
     "VttValidationError",

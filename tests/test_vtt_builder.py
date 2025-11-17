@@ -19,6 +19,12 @@ from vtt_builder import (
     seconds_to_timestamp,
     timestamp_to_seconds,
     get_segments_stats,
+    remove_filler_words,
+    group_by_speaker,
+    filter_by_confidence,
+    words_to_segments,
+    remove_repeated_phrases,
+    detect_chapters,
     VttError,
     VttValidationError,
     VttTimestampError,
@@ -1313,6 +1319,355 @@ class TestGetSegmentsStats:
         stats = get_segments_stats(segments)
         # Total duration should be calculated correctly despite gaps
         assert stats["total_duration"] == 4.0  # 2 + 2, not 12
+
+
+class TestRemoveFillerWords:
+    """Test filler word removal for podcast transcriptions."""
+
+    def test_remove_default_fillers(self):
+        """Test removing default filler words."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Um so basically I think"},
+            {"start": 2.0, "end": 4.0, "text": "You know like it's actually good"},
+        ]
+        result = remove_filler_words(segments)
+        assert result[0]["text"] == "so I think"
+        assert result[1]["text"] == "it's good"
+
+    def test_remove_custom_fillers(self):
+        """Test removing custom filler words."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Well the thing is very interesting"},
+        ]
+        result = remove_filler_words(segments, fillers=["well", "the thing is"])
+        assert result[0]["text"] == "very interesting"
+
+    def test_preserve_timing(self):
+        """Test that timing is preserved."""
+        segments = [
+            {"id": 5, "start": 10.0, "end": 12.0, "text": "Um hello"},
+        ]
+        result = remove_filler_words(segments, preserve_timing=True)
+        assert result[0]["start"] == 10.0
+        assert result[0]["end"] == 12.0
+        assert result[0]["id"] == 5
+
+    def test_case_insensitive_removal(self):
+        """Test filler removal is case-insensitive."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "UM UH LIKE hello"},
+        ]
+        result = remove_filler_words(segments)
+        assert result[0]["text"] == "hello"
+
+    def test_empty_segment_handling(self):
+        """Test handling segments that become empty."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "um uh"},
+            {"start": 2.0, "end": 4.0, "text": "Hello world"},
+        ]
+        result = remove_filler_words(segments, preserve_timing=False)
+        # Empty segment should be removed
+        assert len(result) == 1
+        assert result[0]["text"] == "Hello world"
+
+    def test_preserve_speaker_info(self):
+        """Test that speaker info is preserved."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Um hello", "speaker": "Alice"},
+        ]
+        result = remove_filler_words(segments)
+        assert result[0]["speaker"] == "Alice"
+
+    def test_empty_segments_list(self):
+        """Test with empty segments list."""
+        result = remove_filler_words([])
+        assert result == []
+
+
+class TestGroupBySpeaker:
+    """Test speaker diarization grouping."""
+
+    def test_group_same_speaker(self):
+        """Test grouping consecutive same-speaker segments."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker": "Alice"},
+            {"start": 1.0, "end": 2.0, "text": "world", "speaker": "Alice"},
+            {"start": 2.0, "end": 3.0, "text": "test", "speaker": "Alice"},
+        ]
+        result = group_by_speaker(segments)
+        assert len(result) == 1
+        assert result[0]["text"] == "<v Alice>Hello world test"
+        assert result[0]["speaker"] == "Alice"
+
+    def test_group_different_speakers(self):
+        """Test grouping with speaker changes."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker": "Alice"},
+            {"start": 1.0, "end": 2.0, "text": "Hi there", "speaker": "Bob"},
+            {"start": 2.0, "end": 3.0, "text": "How are you", "speaker": "Alice"},
+        ]
+        result = group_by_speaker(segments)
+        assert len(result) == 3
+        assert "<v Alice>Hello" in result[0]["text"]
+        assert "<v Bob>Hi there" in result[1]["text"]
+        assert "<v Alice>How are you" in result[2]["text"]
+
+    def test_group_with_gap_threshold(self):
+        """Test that large gaps break grouping."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker": "Alice"},
+            {"start": 10.0, "end": 11.0, "text": "World", "speaker": "Alice"},
+        ]
+        result = group_by_speaker(segments, max_gap=2.0)
+        assert len(result) == 2  # Gap too large, not merged
+
+    def test_format_speaker_disabled(self):
+        """Test without speaker formatting."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello", "speaker": "Alice"},
+            {"start": 1.0, "end": 2.0, "text": "world", "speaker": "Alice"},
+        ]
+        result = group_by_speaker(segments, format_speaker=False)
+        assert result[0]["text"] == "Hello world"
+        assert "<v" not in result[0]["text"]
+
+    def test_unknown_speaker(self):
+        """Test handling missing speaker field."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "Hello"},
+            {"start": 1.0, "end": 2.0, "text": "world"},
+        ]
+        result = group_by_speaker(segments)
+        assert len(result) == 1
+        assert "Unknown" in result[0]["text"]
+
+    def test_empty_segments_list(self):
+        """Test with empty segments list."""
+        result = group_by_speaker([])
+        assert result == []
+
+
+class TestFilterByConfidence:
+    """Test confidence-based filtering."""
+
+    def test_filter_low_confidence(self):
+        """Test removing low confidence segments."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "High", "confidence": 0.95},
+            {"start": 2.0, "end": 4.0, "text": "Low", "confidence": 0.5},
+            {"start": 4.0, "end": 6.0, "text": "Medium", "confidence": 0.85},
+        ]
+        result = filter_by_confidence(segments, min_confidence=0.8)
+        assert len(result) == 2
+        assert result[0]["text"] == "High"
+        assert result[1]["text"] == "Medium"
+
+    def test_mark_low_confidence(self):
+        """Test marking instead of removing low confidence segments."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "High", "confidence": 0.95},
+            {"start": 2.0, "end": 4.0, "text": "Low", "confidence": 0.5},
+        ]
+        result = filter_by_confidence(segments, min_confidence=0.8, remove_or_mark="mark")
+        assert len(result) == 2
+        assert "low_confidence" not in result[0]
+        assert result[1]["low_confidence"] is True
+
+    def test_assume_high_confidence_when_missing(self):
+        """Test assuming high confidence when field is missing."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "No confidence field"},
+        ]
+        result = filter_by_confidence(segments, min_confidence=0.8)
+        assert len(result) == 1
+
+    def test_preserves_confidence_in_output(self):
+        """Test that confidence is preserved in output."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Test", "confidence": 0.92},
+        ]
+        result = filter_by_confidence(segments, min_confidence=0.8)
+        assert result[0]["confidence"] == 0.92
+
+    def test_preserves_speaker_info(self):
+        """Test that speaker info is preserved."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Test", "confidence": 0.9, "speaker": "Bob"},
+        ]
+        result = filter_by_confidence(segments)
+        assert result[0]["speaker"] == "Bob"
+
+    def test_empty_segments_list(self):
+        """Test with empty segments list."""
+        result = filter_by_confidence([])
+        assert result == []
+
+
+class TestWordsToSegments:
+    """Test word-level to segment-level aggregation."""
+
+    def test_basic_word_aggregation(self):
+        """Test basic word aggregation."""
+        words = [
+            {"word": "Hello", "start": 0.0, "end": 0.5},
+            {"word": "world.", "start": 0.6, "end": 1.0},
+            {"word": "How", "start": 1.5, "end": 1.8},
+            {"word": "are", "start": 1.9, "end": 2.1},
+            {"word": "you?", "start": 2.2, "end": 2.5},
+        ]
+        result = words_to_segments(words)
+        # Should create segments based on punctuation
+        assert len(result) >= 2
+        # First segment should contain at least "Hello"
+        assert "Hello" in result[0]["text"]
+        # Verify segments are created
+        all_text = " ".join(seg["text"] for seg in result)
+        assert "Hello" in all_text
+        assert "world." in all_text
+        assert "you?" in all_text
+
+    def test_pause_threshold_breaks(self):
+        """Test that long pauses break segments."""
+        words = [
+            {"word": "Hello", "start": 0.0, "end": 0.5},
+            {"word": "world", "start": 0.6, "end": 1.0},
+            {"word": "test", "start": 5.0, "end": 5.5},  # Long pause
+        ]
+        result = words_to_segments(words, pause_threshold=1.0)
+        assert len(result) >= 2
+
+    def test_max_duration_limit(self):
+        """Test maximum segment duration limit."""
+        words = [
+            {"word": f"word{i}", "start": i * 0.5, "end": i * 0.5 + 0.4}
+            for i in range(30)
+        ]
+        result = words_to_segments(words, max_segment_duration=5.0)
+        # Should have multiple segments due to duration limit
+        assert len(result) > 1
+        # Check each segment doesn't exceed max duration
+        for seg in result:
+            assert seg["end"] - seg["start"] <= 6.0  # Some tolerance
+
+    def test_supports_text_field(self):
+        """Test that 'text' field works as alternative to 'word'."""
+        words = [
+            {"text": "Hello", "start": 0.0, "end": 0.5},
+            {"text": "world", "start": 0.6, "end": 1.0},
+        ]
+        result = words_to_segments(words)
+        assert len(result) >= 1
+        assert "Hello" in result[0]["text"]
+
+    def test_empty_words_list(self):
+        """Test with empty words list."""
+        result = words_to_segments([])
+        assert result == []
+
+
+class TestRemoveRepeatedPhrases:
+    """Test repeated phrase removal."""
+
+    def test_remove_single_word_repetition(self):
+        """Test removing single word repetitions."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "the the the quick brown fox"},
+        ]
+        result = remove_repeated_phrases(segments)
+        assert result[0]["text"] == "the quick brown fox"
+
+    def test_remove_multi_word_repetition(self):
+        """Test removing multi-word phrase repetitions."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "I think I think I think it's good"},
+        ]
+        result = remove_repeated_phrases(segments, min_repetitions=2)
+        assert result[0]["text"] == "I think it's good"
+
+    def test_preserve_non_repeated(self):
+        """Test that non-repeated text is preserved."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Hello world this is a test"},
+        ]
+        result = remove_repeated_phrases(segments)
+        assert result[0]["text"] == "Hello world this is a test"
+
+    def test_case_insensitive_matching(self):
+        """Test case-insensitive repetition matching."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Hello HELLO hello world"},
+        ]
+        result = remove_repeated_phrases(segments)
+        assert result[0]["text"] == "Hello world"
+
+    def test_preserves_segment_info(self):
+        """Test that segment info is preserved."""
+        segments = [
+            {"id": 5, "start": 10.0, "end": 12.0, "text": "test test", "speaker": "Alice"},
+        ]
+        result = remove_repeated_phrases(segments)
+        assert result[0]["id"] == 5
+        assert result[0]["start"] == 10.0
+        assert result[0]["speaker"] == "Alice"
+
+    def test_empty_segments_list(self):
+        """Test with empty segments list."""
+        result = remove_repeated_phrases([])
+        assert result == []
+
+
+class TestDetectChapters:
+    """Test automatic chapter detection."""
+
+    def test_detect_chapter_by_silence(self):
+        """Test detecting chapters by long silence."""
+        segments = [
+            {"start": 0.0, "end": 30.0, "text": "Chapter 1 content"},
+            {"start": 31.0, "end": 90.0, "text": "More chapter 1"},  # Long segment
+            {"start": 100.0, "end": 130.0, "text": "Chapter 2 content"},  # 10s gap
+            {"start": 131.0, "end": 160.0, "text": "More chapter 2"},
+        ]
+        result = detect_chapters(segments, min_chapter_duration=60.0, silence_threshold=5.0)
+        assert len(result) >= 2
+        assert result[0]["chapter"] == 1
+        assert result[0]["start"] == 0.0
+        # Second chapter should start at 100.0 (after the gap)
+        assert result[1]["chapter"] == 2
+        assert result[1]["start"] == 100.0
+
+    def test_first_chapter_always_exists(self):
+        """Test that first chapter is always created."""
+        segments = [
+            {"start": 0.0, "end": 10.0, "text": "Content"},
+        ]
+        result = detect_chapters(segments)
+        assert len(result) >= 1
+        assert result[0]["chapter"] == 1
+        assert result[0]["start"] == 0.0
+
+    def test_timestamp_formatting(self):
+        """Test that timestamps are formatted correctly."""
+        segments = [
+            {"start": 3661.0, "end": 3700.0, "text": "Content"},
+        ]
+        result = detect_chapters(segments)
+        assert result[0]["timestamp"] == "01:01:01"
+
+    def test_min_chapter_duration_respected(self):
+        """Test minimum chapter duration is respected."""
+        segments = [
+            {"start": 0.0, "end": 10.0, "text": "Short 1"},
+            {"start": 20.0, "end": 30.0, "text": "Short 2"},  # 10s gap but chapter too short
+        ]
+        result = detect_chapters(segments, min_chapter_duration=60.0, silence_threshold=5.0)
+        # Should not create new chapter since minimum duration not met
+        assert len(result) == 1
+
+    def test_empty_segments_list(self):
+        """Test with empty segments list."""
+        result = detect_chapters([])
+        assert result == []
 
 
 if __name__ == "__main__":
