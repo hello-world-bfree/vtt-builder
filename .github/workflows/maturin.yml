@@ -1,13 +1,9 @@
-name: CI
+name: Build Multi-Platform Wheels
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
-      - '*'
-  pull_request:
+      - 'v*.*.*'
   workflow_dispatch:
     inputs:
       run_linux:
