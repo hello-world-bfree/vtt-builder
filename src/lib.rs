@@ -809,6 +809,602 @@ fn validate_segments(segments_list: &Bound<'_, PyList>) -> PyResult<bool> {
     Ok(true)
 }
 
+/// Builds a VTT string from a list of Python dictionaries (in-memory, no file I/O).
+///
+/// This is useful for:
+/// - Generating VTT content without writing to disk
+/// - Testing and debugging
+/// - Streaming or API responses
+///
+/// # Arguments
+/// * `segments_list` - List of dictionaries with keys: id, start, end, text
+/// * `escape_text` - Whether to escape special characters (default: true)
+/// * `validate` - Whether to validate segment data (default: true)
+///
+/// # Returns
+/// * String containing the complete VTT file content
+#[pyfunction]
+#[pyo3(signature = (segments_list, escape_text=true, validate=true))]
+fn build_vtt_string(
+    segments_list: &Bound<'_, PyList>,
+    escape_text: bool,
+    validate: bool,
+) -> PyResult<String> {
+    let config = VttConfig {
+        escape_special_chars: escape_text,
+        ..Default::default()
+    };
+
+    let mut output = Vec::new();
+    write_vtt_header(&mut output, &config)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    let mut segments = Vec::new();
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let id: u32 = segment_dict
+            .get_item("id")?
+            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+            .unwrap_or((idx + 1) as u32);
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()
+            .map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("'start' must be a number (int or float)")
+            })?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()
+            .map_err(|_| {
+                pyo3::exceptions::PyTypeError::new_err("'end' must be a number (int or float)")
+            })?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()
+            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("'text' must be a string"))?;
+
+        let segment = Segment {
+            id,
+            start,
+            end,
+            text: text.trim().to_string(),
+        };
+
+        if validate {
+            validate_segment(&segment)?;
+        }
+
+        segments.push(segment);
+    }
+
+    write_segments_to_vtt(&segments, 0.0, 1, &mut output, &config)
+        .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
+
+    String::from_utf8(output)
+        .map_err(|e| pyo3::exceptions::PyUnicodeDecodeError::new_err(("utf-8", e.to_string())))
+}
+
+/// Merges consecutive segments with gaps smaller than the threshold.
+///
+/// This is useful for:
+/// - Combining fragmented transcripts
+/// - Reducing the number of cues
+/// - Creating more readable captions
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `gap_threshold` - Maximum gap in seconds to merge (segments with gaps <= this are merged)
+///
+/// # Returns
+/// * List of merged segment dictionaries
+#[pyfunction]
+#[pyo3(signature = (segments_list, gap_threshold=0.5))]
+fn merge_segments(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    gap_threshold: f64,
+) -> PyResult<Py<PyList>> {
+    if segments_list.is_empty() {
+        return Ok(PyList::empty(py).into());
+    }
+
+    let mut segments = Vec::new();
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let id: u32 = segment_dict
+            .get_item("id")?
+            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+            .unwrap_or((idx + 1) as u32);
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        segments.push(Segment {
+            id,
+            start,
+            end,
+            text: text.trim().to_string(),
+        });
+    }
+
+    // Perform merging
+    let mut merged = Vec::new();
+    let mut current = segments[0].clone();
+
+    for segment in &segments[1..] {
+        if segment.start - current.end <= gap_threshold {
+            // Merge: extend end time and concatenate text
+            current.end = segment.end;
+            current.text = format!("{} {}", current.text.trim(), segment.text.trim());
+        } else {
+            merged.push(current);
+            current = segment.clone();
+        }
+    }
+    merged.push(current);
+
+    // Convert back to Python list
+    let result = PyList::empty(py);
+    for (idx, seg) in merged.iter().enumerate() {
+        let dict = PyDict::new(py);
+        dict.set_item("id", (idx + 1) as u32)?;
+        dict.set_item("start", seg.start)?;
+        dict.set_item("end", seg.end)?;
+        dict.set_item("text", &seg.text)?;
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Splits segments that exceed a maximum character length.
+///
+/// This is useful for:
+/// - Ensuring readability of captions
+/// - Meeting platform character limits
+/// - Creating more digestible cue blocks
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `max_chars` - Maximum characters per segment
+///
+/// # Returns
+/// * List of segment dictionaries with long segments split
+#[pyfunction]
+#[pyo3(signature = (segments_list, max_chars=80))]
+fn split_long_segments(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    max_chars: usize,
+) -> PyResult<Py<PyList>> {
+    let result = PyList::empty(py);
+    let mut new_id = 1u32;
+
+    for segment in segments_list.iter() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        let text = text.trim();
+
+        if text.len() <= max_chars {
+            // No need to split
+            let dict = PyDict::new(py);
+            dict.set_item("id", new_id)?;
+            dict.set_item("start", start)?;
+            dict.set_item("end", end)?;
+            dict.set_item("text", text)?;
+            result.append(dict)?;
+            new_id += 1;
+        } else {
+            // Split the segment
+            let words: Vec<&str> = text.split_whitespace().collect();
+            let duration = end - start;
+            let total_chars = text.len() as f64;
+
+            let mut current_text = String::new();
+            let mut current_start = start;
+            let mut chars_so_far = 0usize;
+
+            for word in words {
+                if !current_text.is_empty() && current_text.len() + word.len() + 1 > max_chars {
+                    // Save current segment
+                    let chars_in_segment = current_text.len() as f64;
+                    let segment_duration = (chars_in_segment / total_chars) * duration;
+                    let current_end = current_start + segment_duration;
+
+                    let dict = PyDict::new(py);
+                    dict.set_item("id", new_id)?;
+                    dict.set_item("start", current_start)?;
+                    dict.set_item("end", current_end)?;
+                    dict.set_item("text", current_text.trim())?;
+                    result.append(dict)?;
+                    new_id += 1;
+
+                    chars_so_far += current_text.len();
+                    current_start = current_end;
+                    current_text = word.to_string();
+                } else {
+                    if !current_text.is_empty() {
+                        current_text.push(' ');
+                    }
+                    current_text.push_str(word);
+                }
+            }
+
+            // Don't forget the last segment
+            if !current_text.is_empty() {
+                let dict = PyDict::new(py);
+                dict.set_item("id", new_id)?;
+                dict.set_item("start", current_start)?;
+                dict.set_item("end", end)?;
+                dict.set_item("text", current_text.trim())?;
+                result.append(dict)?;
+                new_id += 1;
+            }
+        }
+    }
+
+    Ok(result.into())
+}
+
+/// Formats seconds to a WebVTT timestamp string.
+///
+/// # Arguments
+/// * `seconds` - Time in seconds (float)
+/// * `use_short_format` - If true and hours=0, returns MM:SS.mmm format
+///
+/// # Returns
+/// * Formatted timestamp string (e.g., "00:01:23.456" or "01:23.456")
+#[pyfunction]
+#[pyo3(signature = (seconds, use_short_format=false))]
+fn seconds_to_timestamp(seconds: f64, use_short_format: bool) -> PyResult<String> {
+    if seconds < 0.0 {
+        return Err(timestamp_error("Seconds cannot be negative"));
+    }
+    if seconds > 359999.999 {
+        return Err(timestamp_error(
+            "Seconds exceeds maximum allowed value (359999.999)",
+        ));
+    }
+    Ok(format_timestamp_flexible(seconds, use_short_format))
+}
+
+/// Parses a WebVTT timestamp string to seconds.
+///
+/// Supports both formats:
+/// - Long: "HH:MM:SS.mmm" (e.g., "01:23:45.678")
+/// - Short: "MM:SS.mmm" (e.g., "23:45.678")
+///
+/// # Arguments
+/// * `timestamp` - Timestamp string to parse
+///
+/// # Returns
+/// * Time in seconds as float
+#[pyfunction]
+fn timestamp_to_seconds(timestamp: &str) -> PyResult<f64> {
+    let parts: Vec<&str> = timestamp.split('.').collect();
+    if parts.len() != 2 {
+        return Err(timestamp_error(&format!(
+            "Invalid timestamp format (missing milliseconds): '{}'",
+            timestamp
+        )));
+    }
+
+    let time_part = parts[0];
+    let millis_str = parts[1];
+
+    if millis_str.len() != 3 {
+        return Err(timestamp_error(&format!(
+            "Milliseconds must be exactly 3 digits: '{}'",
+            millis_str
+        )));
+    }
+
+    let millis: f64 = millis_str.parse::<u32>().map_err(|_| {
+        timestamp_error(&format!(
+            "Invalid milliseconds value: '{}'",
+            millis_str
+        ))
+    })? as f64
+        / 1000.0;
+
+    let time_parts: Vec<&str> = time_part.split(':').collect();
+
+    let seconds = match time_parts.len() {
+        2 => {
+            // MM:SS format
+            let minutes: f64 = time_parts[0].parse::<u32>().map_err(|_| {
+                timestamp_error(&format!("Invalid minutes value: '{}'", time_parts[0]))
+            })? as f64;
+            let secs: f64 = time_parts[1].parse::<u32>().map_err(|_| {
+                timestamp_error(&format!("Invalid seconds value: '{}'", time_parts[1]))
+            })? as f64;
+
+            if secs >= 60.0 {
+                return Err(timestamp_error(&format!(
+                    "Seconds must be 0-59: '{}'",
+                    time_parts[1]
+                )));
+            }
+
+            minutes * 60.0 + secs + millis
+        }
+        3 => {
+            // HH:MM:SS format
+            let hours: f64 = time_parts[0].parse::<u32>().map_err(|_| {
+                timestamp_error(&format!("Invalid hours value: '{}'", time_parts[0]))
+            })? as f64;
+            let minutes: f64 = time_parts[1].parse::<u32>().map_err(|_| {
+                timestamp_error(&format!("Invalid minutes value: '{}'", time_parts[1]))
+            })? as f64;
+            let secs: f64 = time_parts[2].parse::<u32>().map_err(|_| {
+                timestamp_error(&format!("Invalid seconds value: '{}'", time_parts[2]))
+            })? as f64;
+
+            if minutes >= 60.0 {
+                return Err(timestamp_error(&format!(
+                    "Minutes must be 0-59: '{}'",
+                    time_parts[1]
+                )));
+            }
+            if secs >= 60.0 {
+                return Err(timestamp_error(&format!(
+                    "Seconds must be 0-59: '{}'",
+                    time_parts[2]
+                )));
+            }
+
+            hours * 3600.0 + minutes * 60.0 + secs + millis
+        }
+        _ => {
+            return Err(timestamp_error(&format!(
+                "Invalid timestamp format: '{}'",
+                timestamp
+            )))
+        }
+    };
+
+    Ok(seconds)
+}
+
+/// Calculates statistics for a list of segments.
+///
+/// Returns a dictionary with:
+/// - total_duration: Total duration in seconds
+/// - num_segments: Number of segments
+/// - avg_duration: Average segment duration
+/// - total_words: Total word count
+/// - total_chars: Total character count (excluding whitespace normalization)
+/// - avg_words_per_segment: Average words per segment
+/// - avg_chars_per_segment: Average characters per segment
+/// - words_per_second: Speaking rate (words per second)
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+///
+/// # Returns
+/// * Dictionary with statistics
+#[pyfunction]
+fn get_segments_stats(py: Python<'_>, segments_list: &Bound<'_, PyList>) -> PyResult<Py<PyDict>> {
+    let stats = PyDict::new(py);
+
+    if segments_list.is_empty() {
+        stats.set_item("total_duration", 0.0)?;
+        stats.set_item("num_segments", 0)?;
+        stats.set_item("avg_duration", 0.0)?;
+        stats.set_item("total_words", 0)?;
+        stats.set_item("total_chars", 0)?;
+        stats.set_item("avg_words_per_segment", 0.0)?;
+        stats.set_item("avg_chars_per_segment", 0.0)?;
+        stats.set_item("words_per_second", 0.0)?;
+        return Ok(stats.into());
+    }
+
+    let mut total_duration = 0.0f64;
+    let mut total_words = 0usize;
+    let mut total_chars = 0usize;
+    let num_segments = segments_list.len();
+
+    for segment in segments_list.iter() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        total_duration += end - start;
+        total_words += text.split_whitespace().count();
+        total_chars += text.trim().len();
+    }
+
+    let avg_duration = total_duration / num_segments as f64;
+    let avg_words = total_words as f64 / num_segments as f64;
+    let avg_chars = total_chars as f64 / num_segments as f64;
+    let words_per_second = if total_duration > 0.0 {
+        total_words as f64 / total_duration
+    } else {
+        0.0
+    };
+
+    stats.set_item("total_duration", total_duration)?;
+    stats.set_item("num_segments", num_segments)?;
+    stats.set_item("avg_duration", avg_duration)?;
+    stats.set_item("total_words", total_words)?;
+    stats.set_item("total_chars", total_chars)?;
+    stats.set_item("avg_words_per_segment", avg_words)?;
+    stats.set_item("avg_chars_per_segment", avg_chars)?;
+    stats.set_item("words_per_second", words_per_second)?;
+
+    Ok(stats.into())
+}
+
+/// Shifts all segment timestamps by a given offset.
+///
+/// Useful for:
+/// - Synchronizing transcripts with video
+/// - Adjusting timing for different versions
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `offset_seconds` - Time offset in seconds (can be negative)
+///
+/// # Returns
+/// * List of segments with adjusted timestamps
+#[pyfunction]
+fn shift_timestamps(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    offset_seconds: f64,
+) -> PyResult<Py<PyList>> {
+    let result = PyList::empty(py);
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let id: u32 = segment_dict
+            .get_item("id")?
+            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+            .unwrap_or((idx + 1) as u32);
+
+        let start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        let text: String = segment_dict
+            .get_item("text")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+            .extract()?;
+
+        let new_start = start + offset_seconds;
+        let new_end = end + offset_seconds;
+
+        if new_start < 0.0 || new_end < 0.0 {
+            return Err(timestamp_error(&format!(
+                "Segment {}: shifting by {} would result in negative timestamp",
+                id, offset_seconds
+            )));
+        }
+
+        let dict = PyDict::new(py);
+        dict.set_item("id", id)?;
+        dict.set_item("start", new_start)?;
+        dict.set_item("end", new_end)?;
+        dict.set_item("text", text.trim())?;
+        result.append(dict)?;
+    }
+
+    Ok(result.into())
+}
+
+/// Filters segments to only include those within a time range.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `start_time` - Start of time range (inclusive)
+/// * `end_time` - End of time range (inclusive)
+///
+/// # Returns
+/// * List of segments that overlap with the time range
+#[pyfunction]
+#[pyo3(signature = (segments_list, start_time, end_time))]
+fn filter_segments_by_time(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    start_time: f64,
+    end_time: f64,
+) -> PyResult<Py<PyList>> {
+    let result = PyList::empty(py);
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+
+        let seg_start: f64 = segment_dict
+            .get_item("start")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+            .extract()?;
+
+        let seg_end: f64 = segment_dict
+            .get_item("end")?
+            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+            .extract()?;
+
+        // Include segment if it overlaps with the range
+        if seg_end >= start_time && seg_start <= end_time {
+            let id: u32 = segment_dict
+                .get_item("id")?
+                .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+                .unwrap_or((idx + 1) as u32);
+
+            let text: String = segment_dict
+                .get_item("text")?
+                .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+                .extract()?;
+
+            let dict = PyDict::new(py);
+            dict.set_item("id", id)?;
+            dict.set_item("start", seg_start)?;
+            dict.set_item("end", seg_end)?;
+            dict.set_item("text", text.trim())?;
+            result.append(dict)?;
+        }
+    }
+
+    Ok(result.into())
+}
+
 #[pymodule]
 fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add custom exception types for better error handling in Python
@@ -823,6 +1419,7 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(build_transcript_from_json_files, m)?)?;
     m.add_function(wrap_pyfunction!(build_vtt_from_json_files, m)?)?;
     m.add_function(wrap_pyfunction!(build_vtt_from_records, m)?)?;
+    m.add_function(wrap_pyfunction!(build_vtt_string, m)?)?;
 
     // Add validation functions
     m.add_function(wrap_pyfunction!(validate_vtt_file, m)?)?;
@@ -831,6 +1428,19 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add utility functions
     m.add_function(wrap_pyfunction!(escape_vtt_text_py, m)?)?;
     m.add_function(wrap_pyfunction!(unescape_vtt_text, m)?)?;
+
+    // Add transformation functions
+    m.add_function(wrap_pyfunction!(merge_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(split_long_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(shift_timestamps, m)?)?;
+    m.add_function(wrap_pyfunction!(filter_segments_by_time, m)?)?;
+
+    // Add timestamp conversion functions
+    m.add_function(wrap_pyfunction!(seconds_to_timestamp, m)?)?;
+    m.add_function(wrap_pyfunction!(timestamp_to_seconds, m)?)?;
+
+    // Add statistics functions
+    m.add_function(wrap_pyfunction!(get_segments_stats, m)?)?;
 
     Ok(())
 }

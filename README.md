@@ -10,6 +10,8 @@ High-performance WebVTT file generation with spec compliance, powered by Rust.
 - **Multilingual**: Full Unicode support for Spanish, Portuguese, French, German, Italian, Polish, and more
 - **Flexible**: Build from JSON files or Python dictionaries
 - **Robust**: Comprehensive error handling with specific exception types
+- **Versatile**: Rich set of transformation utilities (merge, split, shift, filter)
+- **Insightful**: Built-in statistics and analysis functions
 
 ## Installation
 
@@ -313,6 +315,107 @@ clean = escape_vtt_text(text)
 # "HTML: &lt;div&gt; &amp; &lt;span&gt;"
 ```
 
+## Transformation Utilities
+
+VTT Builder provides powerful utilities for transforming segment data:
+
+### Merge Adjacent Segments
+
+```python
+from vtt_builder import merge_segments
+
+segments = [
+    {"start": 0.0, "end": 1.0, "text": "Hello"},
+    {"start": 1.0, "end": 2.0, "text": "world"},
+    {"start": 10.0, "end": 11.0, "text": "Separate"},
+]
+
+merged = merge_segments(segments, gap_threshold=0.5)
+# [{"id": 1, "start": 0.0, "end": 2.0, "text": "Hello world"},
+#  {"id": 2, "start": 10.0, "end": 11.0, "text": "Separate"}]
+```
+
+### Split Long Segments
+
+```python
+from vtt_builder import split_long_segments
+
+segments = [
+    {"start": 0.0, "end": 10.0, "text": "Very long text that exceeds character limits"}
+]
+
+split = split_long_segments(segments, max_chars=20)
+# Multiple segments with proportional timestamps
+```
+
+### Shift Timestamps
+
+```python
+from vtt_builder import shift_timestamps
+
+segments = [{"start": 0.0, "end": 2.0, "text": "Test"}]
+shifted = shift_timestamps(segments, offset_seconds=10.0)
+# [{"start": 10.0, "end": 12.0, "text": "Test"}]
+```
+
+### Filter by Time Range
+
+```python
+from vtt_builder import filter_segments_by_time
+
+segments = [
+    {"start": 0.0, "end": 5.0, "text": "Early"},
+    {"start": 10.0, "end": 15.0, "text": "Middle"},
+    {"start": 20.0, "end": 25.0, "text": "Late"},
+]
+
+filtered = filter_segments_by_time(segments, start_time=8.0, end_time=18.0)
+# [{"start": 10.0, "end": 15.0, "text": "Middle"}]
+```
+
+### Timestamp Conversion
+
+```python
+from vtt_builder import seconds_to_timestamp, timestamp_to_seconds
+
+timestamp = seconds_to_timestamp(3661.123)
+# "01:01:01.123"
+
+seconds = timestamp_to_seconds("01:01:01.123")
+# 3661.123
+```
+
+### Statistics
+
+```python
+from vtt_builder import get_segments_stats
+
+segments = [
+    {"start": 0.0, "end": 2.0, "text": "Hello world"},
+    {"start": 2.0, "end": 5.0, "text": "This is a test"},
+]
+
+stats = get_segments_stats(segments)
+# {
+#   "total_duration": 5.0,
+#   "num_segments": 2,
+#   "avg_duration": 2.5,
+#   "total_words": 6,
+#   "words_per_second": 1.2,
+#   ...
+# }
+```
+
+### In-Memory VTT Building
+
+```python
+from vtt_builder import build_vtt_string
+
+segments = [{"start": 0.0, "end": 2.0, "text": "Hello"}]
+vtt_content = build_vtt_string(segments)
+# Returns WebVTT string without writing to disk
+```
+
 ## Documentation
 
 - [API Reference](docs/API.md) - Complete function documentation
@@ -343,6 +446,7 @@ MIT
 
 ## Version History
 
+- **0.4.0** - Transformation utilities: merge, split, shift, filter, stats, in-memory building
 - **0.3.0** - WebVTT spec compliance: character escaping, input validation, custom exceptions
 - **0.2.1** - Handle multiple newlines, tabs, carriage returns
 - **0.2.0** - Support NOTE and STYLE blocks

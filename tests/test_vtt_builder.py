@@ -7,10 +7,18 @@ from vtt_builder import (
     build_transcript_from_json_files,
     build_vtt_from_json_files,
     build_vtt_from_records,
+    build_vtt_string,
     validate_vtt_file,
     validate_segments,
     escape_vtt_text,
     unescape_vtt_text,
+    merge_segments,
+    split_long_segments,
+    shift_timestamps,
+    filter_segments_by_time,
+    seconds_to_timestamp,
+    timestamp_to_seconds,
+    get_segments_stats,
     VttError,
     VttValidationError,
     VttTimestampError,
@@ -864,6 +872,447 @@ class TestEdgeCases:
 
         # VttError itself should be a ValueError
         assert issubclass(VttError, ValueError)
+
+
+class TestBuildVTTString:
+    """Test in-memory VTT string building."""
+
+    def test_build_vtt_string_basic(self):
+        """Test basic in-memory VTT string generation."""
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.5, "text": "Hello world"},
+            {"id": 2, "start": 2.5, "end": 5.0, "text": "This is a test"},
+        ]
+        result = build_vtt_string(segments)
+
+        assert result.startswith("WEBVTT\n")
+        assert "1\n00:00:00.000 --> 00:00:02.500\nHello world" in result
+        assert "2\n00:00:02.500 --> 00:00:05.000\nThis is a test" in result
+
+    def test_build_vtt_string_with_escaping(self):
+        """Test that special characters are escaped."""
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.0, "text": "Tom & Jerry"},
+        ]
+        result = build_vtt_string(segments)
+        assert "Tom &amp; Jerry" in result
+
+    def test_build_vtt_string_without_escaping(self):
+        """Test disabling character escaping."""
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.0, "text": "Tom & Jerry"},
+        ]
+        result = build_vtt_string(segments, escape_text=False)
+        assert "Tom & Jerry" in result
+        assert "&amp;" not in result
+
+    def test_build_vtt_string_empty_segments(self):
+        """Test with empty segments list."""
+        result = build_vtt_string([])
+        assert result.strip() == "WEBVTT"
+
+    def test_build_vtt_string_with_validation(self):
+        """Test that validation catches errors."""
+        segments = [
+            {"start": 5.0, "end": 2.0, "text": "Invalid"},
+        ]
+        with pytest.raises(VttTimestampError):
+            build_vtt_string(segments, validate=True)
+
+    def test_build_vtt_string_skip_validation(self):
+        """Test skipping validation."""
+        segments = [
+            {"start": 5.0, "end": 2.0, "text": "Invalid but allowed"},
+        ]
+        # Should not raise when validation is disabled
+        result = build_vtt_string(segments, validate=False)
+        assert "Invalid but allowed" in result
+
+
+class TestTimestampConversion:
+    """Test timestamp conversion utilities."""
+
+    def test_seconds_to_timestamp_zero(self):
+        """Test converting zero seconds."""
+        result = seconds_to_timestamp(0.0)
+        assert result == "00:00:00.000"
+
+    def test_seconds_to_timestamp_minutes(self):
+        """Test converting minutes."""
+        result = seconds_to_timestamp(125.5)
+        assert result == "00:02:05.500"
+
+    def test_seconds_to_timestamp_hours(self):
+        """Test converting hours."""
+        result = seconds_to_timestamp(3661.123)
+        assert result == "01:01:01.123"
+
+    def test_seconds_to_timestamp_large_value(self):
+        """Test large timestamp value."""
+        result = seconds_to_timestamp(86400.0)  # 24 hours
+        assert result == "24:00:00.000"
+
+    def test_seconds_to_timestamp_precision(self):
+        """Test millisecond precision."""
+        result = seconds_to_timestamp(1.001)
+        assert result == "00:00:01.001"
+
+    def test_timestamp_to_seconds_zero(self):
+        """Test parsing zero timestamp."""
+        result = timestamp_to_seconds("00:00:00.000")
+        assert result == 0.0
+
+    def test_timestamp_to_seconds_minutes(self):
+        """Test parsing timestamp with minutes."""
+        result = timestamp_to_seconds("00:02:05.500")
+        assert abs(result - 125.5) < 0.001
+
+    def test_timestamp_to_seconds_hours(self):
+        """Test parsing timestamp with hours."""
+        result = timestamp_to_seconds("01:01:01.123")
+        assert abs(result - 3661.123) < 0.001
+
+    def test_timestamp_to_seconds_short_format(self):
+        """Test parsing short format timestamp (MM:SS.mmm)."""
+        result = timestamp_to_seconds("02:05.500")
+        assert abs(result - 125.5) < 0.001
+
+    def test_timestamp_to_seconds_invalid_format(self):
+        """Test parsing invalid timestamp format."""
+        with pytest.raises(VttTimestampError):
+            timestamp_to_seconds("invalid")
+
+    def test_timestamp_roundtrip(self):
+        """Test converting back and forth."""
+        original = 3661.123
+        timestamp = seconds_to_timestamp(original)
+        back = timestamp_to_seconds(timestamp)
+        assert abs(original - back) < 0.001
+
+
+class TestMergeSegments:
+    """Test segment merging functionality."""
+
+    def test_merge_segments_no_merge_needed(self):
+        """Test when segments don't need merging."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "First"},
+            {"start": 5.0, "end": 7.0, "text": "Second"},
+        ]
+        result = merge_segments(segments, gap_threshold=0.5)
+        assert len(result) == 2
+
+    def test_merge_segments_adjacent(self):
+        """Test merging adjacent segments."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "First"},
+            {"start": 2.0, "end": 4.0, "text": "Second"},
+        ]
+        result = merge_segments(segments, gap_threshold=0.5)
+        assert len(result) == 1
+        assert result[0]["text"] == "First Second"
+        assert result[0]["start"] == 0.0
+        assert result[0]["end"] == 4.0
+
+    def test_merge_segments_small_gap(self):
+        """Test merging with small gap."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "First"},
+            {"start": 2.3, "end": 4.0, "text": "Second"},
+        ]
+        result = merge_segments(segments, gap_threshold=0.5)
+        assert len(result) == 1
+        assert result[0]["text"] == "First Second"
+
+    def test_merge_segments_multiple(self):
+        """Test merging multiple segments."""
+        segments = [
+            {"start": 0.0, "end": 1.0, "text": "One"},
+            {"start": 1.0, "end": 2.0, "text": "Two"},
+            {"start": 2.0, "end": 3.0, "text": "Three"},
+            {"start": 10.0, "end": 11.0, "text": "Four"},
+        ]
+        result = merge_segments(segments, gap_threshold=0.5)
+        assert len(result) == 2
+        assert result[0]["text"] == "One Two Three"
+        assert result[1]["text"] == "Four"
+
+    def test_merge_segments_preserves_ids(self):
+        """Test that merged segments get new IDs."""
+        segments = [
+            {"id": 10, "start": 0.0, "end": 2.0, "text": "First"},
+            {"id": 20, "start": 2.0, "end": 4.0, "text": "Second"},
+        ]
+        result = merge_segments(segments, gap_threshold=0.5)
+        assert len(result) == 1
+        # ID should be reset to sequential
+        assert result[0]["id"] == 1
+
+    def test_merge_segments_empty_list(self):
+        """Test merging empty list."""
+        result = merge_segments([], gap_threshold=0.5)
+        assert result == []
+
+    def test_merge_segments_single(self):
+        """Test merging single segment."""
+        segments = [{"start": 0.0, "end": 2.0, "text": "Only"}]
+        result = merge_segments(segments, gap_threshold=0.5)
+        assert len(result) == 1
+        assert result[0]["text"] == "Only"
+
+
+class TestSplitLongSegments:
+    """Test segment splitting functionality."""
+
+    def test_split_short_segment(self):
+        """Test that short segments aren't split."""
+        segments = [{"start": 0.0, "end": 2.0, "text": "Short text"}]
+        result = split_long_segments(segments, max_chars=50)
+        assert len(result) == 1
+        assert result[0]["text"] == "Short text"
+
+    def test_split_long_segment(self):
+        """Test splitting a long segment."""
+        long_text = "This is a very long segment that needs to be split into multiple parts for better readability"
+        segments = [{"start": 0.0, "end": 10.0, "text": long_text}]
+        result = split_long_segments(segments, max_chars=30)
+        assert len(result) > 1
+        # Check all text is preserved
+        combined_text = " ".join(seg["text"] for seg in result)
+        assert combined_text == long_text
+
+    def test_split_preserves_timing(self):
+        """Test that timing is distributed proportionally."""
+        segments = [{"start": 0.0, "end": 10.0, "text": "Word1 Word2 Word3 Word4"}]
+        result = split_long_segments(segments, max_chars=10)
+        # Should split into multiple segments
+        assert len(result) >= 2
+        # First segment should start at 0.0
+        assert result[0]["start"] == 0.0
+        # Last segment should end at 10.0
+        assert result[-1]["end"] == 10.0
+        # Segments should be continuous
+        for i in range(len(result) - 1):
+            assert result[i]["end"] == result[i + 1]["start"]
+
+    def test_split_multiple_segments(self):
+        """Test splitting multiple segments."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "Short"},
+            {"start": 5.0, "end": 15.0, "text": "This is a longer segment that needs splitting"},
+        ]
+        result = split_long_segments(segments, max_chars=20)
+        assert len(result) >= 3  # At least: 1 short + 2+ split
+
+    def test_split_assigns_new_ids(self):
+        """Test that split segments get sequential IDs."""
+        segments = [
+            {"id": 1, "start": 0.0, "end": 10.0, "text": "Long text that needs to be split into parts"}
+        ]
+        result = split_long_segments(segments, max_chars=15)
+        # Check IDs are sequential
+        for i, seg in enumerate(result):
+            assert seg["id"] == i + 1
+
+    def test_split_empty_list(self):
+        """Test splitting empty list."""
+        result = split_long_segments([], max_chars=50)
+        assert result == []
+
+    def test_split_respects_word_boundaries(self):
+        """Test that splits occur at word boundaries."""
+        segments = [{"start": 0.0, "end": 10.0, "text": "Hello world this is test"}]
+        result = split_long_segments(segments, max_chars=12)
+        # Each segment text should be complete words
+        for seg in result:
+            # Should not end with partial words
+            assert not seg["text"].endswith(" ")
+            assert seg["text"].strip() == seg["text"]
+
+
+class TestShiftTimestamps:
+    """Test timestamp shifting functionality."""
+
+    def test_shift_timestamps_positive(self):
+        """Test shifting timestamps forward."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "First"},
+            {"start": 2.0, "end": 4.0, "text": "Second"},
+        ]
+        result = shift_timestamps(segments, offset_seconds=10.0)
+        assert result[0]["start"] == 10.0
+        assert result[0]["end"] == 12.0
+        assert result[1]["start"] == 12.0
+        assert result[1]["end"] == 14.0
+
+    def test_shift_timestamps_negative(self):
+        """Test shifting timestamps backward."""
+        segments = [
+            {"start": 10.0, "end": 12.0, "text": "First"},
+            {"start": 12.0, "end": 14.0, "text": "Second"},
+        ]
+        result = shift_timestamps(segments, offset_seconds=-5.0)
+        assert result[0]["start"] == 5.0
+        assert result[0]["end"] == 7.0
+
+    def test_shift_timestamps_preserves_text(self):
+        """Test that text is preserved during shift."""
+        segments = [{"start": 0.0, "end": 2.0, "text": "Keep this"}]
+        result = shift_timestamps(segments, offset_seconds=5.0)
+        assert result[0]["text"] == "Keep this"
+
+    def test_shift_timestamps_preserves_ids(self):
+        """Test that IDs are preserved during shift."""
+        segments = [{"id": 42, "start": 0.0, "end": 2.0, "text": "Test"}]
+        result = shift_timestamps(segments, offset_seconds=5.0)
+        assert result[0]["id"] == 42
+
+    def test_shift_timestamps_empty_list(self):
+        """Test shifting empty list."""
+        result = shift_timestamps([], offset_seconds=10.0)
+        assert result == []
+
+    def test_shift_timestamps_zero_offset(self):
+        """Test shifting with zero offset."""
+        segments = [{"start": 1.0, "end": 3.0, "text": "Test"}]
+        result = shift_timestamps(segments, offset_seconds=0.0)
+        assert result[0]["start"] == 1.0
+        assert result[0]["end"] == 3.0
+
+
+class TestFilterSegmentsByTime:
+    """Test time-based segment filtering."""
+
+    def test_filter_within_range(self):
+        """Test filtering segments within time range."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "First"},
+            {"start": 5.0, "end": 7.0, "text": "Second"},
+            {"start": 10.0, "end": 12.0, "text": "Third"},
+        ]
+        result = filter_segments_by_time(segments, start_time=4.0, end_time=8.0)
+        assert len(result) == 1
+        assert result[0]["text"] == "Second"
+
+    def test_filter_overlapping_start(self):
+        """Test segment overlapping filter start."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "Overlaps start"},
+            {"start": 10.0, "end": 15.0, "text": "After"},
+        ]
+        result = filter_segments_by_time(segments, start_time=3.0, end_time=20.0)
+        # Should include segment that overlaps
+        assert len(result) == 2
+
+    def test_filter_overlapping_end(self):
+        """Test segment overlapping filter end."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "Before"},
+            {"start": 10.0, "end": 15.0, "text": "Overlaps end"},
+        ]
+        result = filter_segments_by_time(segments, start_time=0.0, end_time=12.0)
+        assert len(result) == 2
+
+    def test_filter_no_matches(self):
+        """Test filtering with no matching segments."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Too early"},
+            {"start": 100.0, "end": 102.0, "text": "Too late"},
+        ]
+        result = filter_segments_by_time(segments, start_time=10.0, end_time=20.0)
+        assert len(result) == 0
+
+    def test_filter_all_match(self):
+        """Test filtering where all segments match."""
+        segments = [
+            {"start": 5.0, "end": 7.0, "text": "First"},
+            {"start": 8.0, "end": 10.0, "text": "Second"},
+        ]
+        result = filter_segments_by_time(segments, start_time=0.0, end_time=20.0)
+        assert len(result) == 2
+
+    def test_filter_empty_list(self):
+        """Test filtering empty list."""
+        result = filter_segments_by_time([], start_time=0.0, end_time=10.0)
+        assert result == []
+
+    def test_filter_preserves_segment_data(self):
+        """Test that filtered segments preserve all data."""
+        segments = [{"id": 5, "start": 1.0, "end": 3.0, "text": "Keep me"}]
+        result = filter_segments_by_time(segments, start_time=0.0, end_time=10.0)
+        assert result[0]["id"] == 5
+        assert result[0]["text"] == "Keep me"
+
+
+class TestGetSegmentsStats:
+    """Test statistics calculation functionality."""
+
+    def test_stats_basic(self):
+        """Test basic statistics calculation."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Hello world"},
+            {"start": 2.0, "end": 5.0, "text": "This is a test"},
+        ]
+        stats = get_segments_stats(segments)
+        assert stats["num_segments"] == 2
+        assert stats["total_duration"] == 5.0
+        assert stats["total_chars"] == 25  # "Hello world" (11) + "This is a test" (14)
+        assert stats["total_words"] == 6  # "Hello world This is a test"
+
+    def test_stats_empty(self):
+        """Test statistics for empty segments."""
+        stats = get_segments_stats([])
+        assert stats["num_segments"] == 0
+        assert stats["total_duration"] == 0.0
+        assert stats["total_chars"] == 0
+        assert stats["total_words"] == 0
+
+    def test_stats_single_segment(self):
+        """Test statistics for single segment."""
+        segments = [{"start": 10.0, "end": 15.0, "text": "Five seconds long"}]
+        stats = get_segments_stats(segments)
+        assert stats["num_segments"] == 1
+        assert stats["total_duration"] == 5.0
+        assert stats["total_words"] == 3
+
+    def test_stats_average_calculations(self):
+        """Test average calculations."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Short"},
+            {"start": 2.0, "end": 6.0, "text": "Longer segment here"},
+        ]
+        stats = get_segments_stats(segments)
+        assert stats["avg_duration"] == 3.0  # (2 + 4) / 2
+        # Average chars: (5 + 19) / 2 = 12
+        assert stats["avg_chars_per_segment"] == 12.0
+
+    def test_stats_words_per_second(self):
+        """Test words per second calculation."""
+        segments = [
+            {"start": 0.0, "end": 60.0, "text": "One two three four five six seven eight nine ten"},
+        ]
+        stats = get_segments_stats(segments)
+        # 10 words in 60 seconds = 0.1666... words per second
+        assert abs(stats["words_per_second"] - (10.0 / 60.0)) < 0.001
+
+    def test_stats_avg_words_per_segment(self):
+        """Test average words per segment calculation."""
+        segments = [
+            {"start": 0.0, "end": 10.0, "text": "One two three four five"},  # 5 words
+            {"start": 10.0, "end": 20.0, "text": "Six seven eight nine ten"},  # 5 words
+        ]
+        stats = get_segments_stats(segments)
+        assert stats["avg_words_per_segment"] == 5.0
+
+    def test_stats_with_gaps(self):
+        """Test statistics with gaps between segments."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "First"},
+            {"start": 10.0, "end": 12.0, "text": "Second"},
+        ]
+        stats = get_segments_stats(segments)
+        # Total duration should be calculated correctly despite gaps
+        assert stats["total_duration"] == 4.0  # 2 + 2, not 12
 
 
 if __name__ == "__main__":

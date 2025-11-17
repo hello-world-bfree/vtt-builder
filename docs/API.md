@@ -425,6 +425,354 @@ unescaped = unescape_vtt_text(text)
 
 ---
 
+### `build_vtt_string`
+
+Build a WebVTT string in memory (no file I/O).
+
+```python
+def build_vtt_string(
+    segments_list: list[dict],
+    escape_text: bool = True,
+    validate: bool = True
+) -> str
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | List of segment dictionaries |
+| `escape_text` | `bool` | `True` | Escape special characters |
+| `validate` | `bool` | `True` | Validate segments before building |
+
+**Returns:** WebVTT formatted string
+
+**Example:**
+
+```python
+from vtt_builder import build_vtt_string
+
+segments = [
+    {"start": 0.0, "end": 2.0, "text": "Hello world"},
+    {"start": 2.0, "end": 4.0, "text": "Test & demo"},
+]
+
+vtt_content = build_vtt_string(segments)
+print(vtt_content)
+# WEBVTT
+#
+# 1
+# 00:00:00.000 --> 00:00:02.000
+# Hello world
+#
+# 2
+# 00:00:02.000 --> 00:00:04.000
+# Test &amp; demo
+
+# Store in database, return via API, etc.
+response.headers["Content-Type"] = "text/vtt"
+return vtt_content
+```
+
+---
+
+### `merge_segments`
+
+Merge adjacent segments that are separated by small gaps.
+
+```python
+def merge_segments(
+    segments_list: list[dict],
+    gap_threshold: float = 0.5
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | List of segment dictionaries |
+| `gap_threshold` | `float` | `0.5` | Maximum gap (seconds) to merge |
+
+**Returns:** List of merged segment dictionaries with new sequential IDs
+
+**Example:**
+
+```python
+from vtt_builder import merge_segments
+
+segments = [
+    {"start": 0.0, "end": 1.0, "text": "Hello"},
+    {"start": 1.0, "end": 2.0, "text": "world"},
+    {"start": 2.0, "end": 3.0, "text": "test"},
+    {"start": 10.0, "end": 11.0, "text": "separate"},
+]
+
+merged = merge_segments(segments, gap_threshold=0.5)
+# Result:
+# [
+#   {"id": 1, "start": 0.0, "end": 3.0, "text": "Hello world test"},
+#   {"id": 2, "start": 10.0, "end": 11.0, "text": "separate"}
+# ]
+```
+
+---
+
+### `split_long_segments`
+
+Split long segments into smaller chunks at word boundaries.
+
+```python
+def split_long_segments(
+    segments_list: list[dict],
+    max_chars: int = 80
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `segments_list` | `list[dict]` | (required) | List of segment dictionaries |
+| `max_chars` | `int` | `80` | Maximum characters per segment |
+
+**Returns:** List of split segment dictionaries with proportional timestamps
+
+**Example:**
+
+```python
+from vtt_builder import split_long_segments
+
+segments = [
+    {
+        "start": 0.0,
+        "end": 10.0,
+        "text": "This is a very long segment that needs to be split into multiple smaller chunks"
+    }
+]
+
+split = split_long_segments(segments, max_chars=30)
+# Result: Multiple segments with text split at word boundaries
+# Each segment has proportionally distributed timestamps
+```
+
+---
+
+### `shift_timestamps`
+
+Shift all segment timestamps by a given offset.
+
+```python
+def shift_timestamps(
+    segments_list: list[dict],
+    offset_seconds: float
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `segments_list` | `list[dict]` | List of segment dictionaries |
+| `offset_seconds` | `float` | Time offset in seconds (can be negative) |
+
+**Returns:** List of segments with adjusted timestamps
+
+**Example:**
+
+```python
+from vtt_builder import shift_timestamps
+
+segments = [
+    {"id": 1, "start": 0.0, "end": 2.0, "text": "First"},
+    {"id": 2, "start": 2.0, "end": 4.0, "text": "Second"},
+]
+
+# Shift forward by 10 seconds
+shifted = shift_timestamps(segments, offset_seconds=10.0)
+# Result:
+# [
+#   {"id": 1, "start": 10.0, "end": 12.0, "text": "First"},
+#   {"id": 2, "start": 12.0, "end": 14.0, "text": "Second"}
+# ]
+
+# Shift backward by 5 seconds
+shifted_back = shift_timestamps(segments, offset_seconds=-5.0)
+```
+
+---
+
+### `filter_segments_by_time`
+
+Filter segments that overlap with a given time range.
+
+```python
+def filter_segments_by_time(
+    segments_list: list[dict],
+    start_time: float,
+    end_time: float
+) -> list[dict]
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `segments_list` | `list[dict]` | List of segment dictionaries |
+| `start_time` | `float` | Start of time range (seconds) |
+| `end_time` | `float` | End of time range (seconds) |
+
+**Returns:** List of segments that overlap with the time range
+
+**Example:**
+
+```python
+from vtt_builder import filter_segments_by_time
+
+segments = [
+    {"start": 0.0, "end": 5.0, "text": "Early"},
+    {"start": 10.0, "end": 15.0, "text": "Middle"},
+    {"start": 20.0, "end": 25.0, "text": "Late"},
+]
+
+# Get segments between 8 and 18 seconds
+filtered = filter_segments_by_time(segments, start_time=8.0, end_time=18.0)
+# Result: [{"start": 10.0, "end": 15.0, "text": "Middle"}]
+
+# Partial overlaps are included
+filtered2 = filter_segments_by_time(segments, start_time=3.0, end_time=12.0)
+# Result: Both "Early" (ends at 5.0) and "Middle" (starts at 10.0)
+```
+
+---
+
+### `seconds_to_timestamp`
+
+Convert seconds to WebVTT timestamp format.
+
+```python
+def seconds_to_timestamp(
+    seconds: float,
+    use_short_format: bool = False
+) -> str
+```
+
+**Parameters:**
+
+| Name | Type | Default | Description |
+|------|------|---------|-------------|
+| `seconds` | `float` | (required) | Time in seconds |
+| `use_short_format` | `bool` | `False` | Use MM:SS.mmm format if < 1 hour |
+
+**Returns:** Formatted timestamp string
+
+**Example:**
+
+```python
+from vtt_builder import seconds_to_timestamp
+
+# Standard format (HH:MM:SS.mmm)
+timestamp = seconds_to_timestamp(3661.123)
+# Result: "01:01:01.123"
+
+# Zero seconds
+timestamp = seconds_to_timestamp(0.0)
+# Result: "00:00:00.000"
+
+# Large values
+timestamp = seconds_to_timestamp(86400.0)  # 24 hours
+# Result: "24:00:00.000"
+```
+
+---
+
+### `timestamp_to_seconds`
+
+Parse a WebVTT timestamp string to seconds.
+
+```python
+def timestamp_to_seconds(timestamp: str) -> float
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `timestamp` | `str` | WebVTT timestamp (HH:MM:SS.mmm or MM:SS.mmm) |
+
+**Returns:** Time in seconds
+
+**Example:**
+
+```python
+from vtt_builder import timestamp_to_seconds
+
+# Long format
+seconds = timestamp_to_seconds("01:01:01.123")
+# Result: 3661.123
+
+# Short format (MM:SS.mmm)
+seconds = timestamp_to_seconds("02:05.500")
+# Result: 125.5
+
+# Invalid format raises VttTimestampError
+try:
+    timestamp_to_seconds("invalid")
+except VttTimestampError as e:
+    print(f"Parse error: {e}")
+```
+
+---
+
+### `get_segments_stats`
+
+Calculate statistics for a list of segments.
+
+```python
+def get_segments_stats(segments_list: list[dict]) -> dict
+```
+
+**Parameters:**
+
+| Name | Type | Description |
+|------|------|-------------|
+| `segments_list` | `list[dict]` | List of segment dictionaries |
+
+**Returns:** Dictionary containing statistics
+
+**Statistics Dictionary:**
+
+| Key | Type | Description |
+|-----|------|-------------|
+| `total_duration` | `float` | Total duration in seconds |
+| `num_segments` | `int` | Number of segments |
+| `avg_duration` | `float` | Average segment duration |
+| `total_words` | `int` | Total word count |
+| `total_chars` | `int` | Total character count |
+| `avg_words_per_segment` | `float` | Average words per segment |
+| `avg_chars_per_segment` | `float` | Average characters per segment |
+| `words_per_second` | `float` | Words per second rate |
+
+**Example:**
+
+```python
+from vtt_builder import get_segments_stats
+
+segments = [
+    {"start": 0.0, "end": 2.0, "text": "Hello world"},
+    {"start": 2.0, "end": 5.0, "text": "This is a test"},
+]
+
+stats = get_segments_stats(segments)
+print(f"Total duration: {stats['total_duration']}s")  # 5.0
+print(f"Number of segments: {stats['num_segments']}")  # 2
+print(f"Average duration: {stats['avg_duration']}s")  # 2.5
+print(f"Total words: {stats['total_words']}")  # 6
+print(f"Words per second: {stats['words_per_second']:.2f}")  # 1.20
+```
+
+---
+
 ## Exception Types
 
 ### Exception Hierarchy
@@ -751,7 +1099,17 @@ def build_safe_vtt(segments, output_path):
 
 ## Version History
 
-- **0.3.0** (Current)
+- **0.4.0** (Current)
+  - Added `build_vtt_string()` for in-memory VTT generation
+  - Added `merge_segments()` for combining adjacent segments
+  - Added `split_long_segments()` for breaking up long cues
+  - Added `shift_timestamps()` for timestamp adjustment
+  - Added `filter_segments_by_time()` for time-based filtering
+  - Added `seconds_to_timestamp()` and `timestamp_to_seconds()` conversion utilities
+  - Added `get_segments_stats()` for transcript statistics
+  - Enhanced test coverage (114 tests)
+
+- **0.3.0**
   - Added character escaping for WebVTT spec compliance
   - Added custom exception hierarchy
   - Added segment validation
