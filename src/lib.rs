@@ -13,9 +13,11 @@ create_exception!(vtt_builder, VttHeaderError, VttValidationError);
 create_exception!(vtt_builder, VttCueError, VttValidationError);
 create_exception!(vtt_builder, VttEscapingError, VttValidationError);
 
+// Maximum allowed timestamp in seconds (99:59:59.999)
+const MAX_TIMESTAMP_SECONDS: f64 = 359999.999;
+
 #[derive(Deserialize, Debug, Clone)]
 struct Segment {
-    #[allow(dead_code)]
     id: u32,
     start: f64,
     end: f64,
@@ -69,6 +71,44 @@ fn header_error(msg: &str) -> PyErr {
 
 fn cue_error(msg: &str) -> PyErr {
     VttCueError::new_err(msg.to_string())
+}
+
+/// Helper function to extract segment data from a PyDict.
+///
+/// Extracts id, start, end, and text fields from a segment dictionary.
+/// If id is missing, defaults to (idx + 1).
+fn extract_segment_data(
+    segment_dict: &Bound<'_, PyDict>,
+    idx: usize,
+) -> PyResult<(u32, f64, f64, String)> {
+    let id: u32 = segment_dict
+        .get_item("id")?
+        .map(|v| v.extract().unwrap_or((idx + 1) as u32))
+        .unwrap_or((idx + 1) as u32);
+
+    let start: f64 = segment_dict
+        .get_item("start")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
+        .extract()
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("'start' must be a number (int or float)")
+        })?;
+
+    let end: f64 = segment_dict
+        .get_item("end")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
+        .extract()
+        .map_err(|_| {
+            pyo3::exceptions::PyTypeError::new_err("'end' must be a number (int or float)")
+        })?;
+
+    let text: String = segment_dict
+        .get_item("text")?
+        .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
+        .extract()
+        .map_err(|_| pyo3::exceptions::PyTypeError::new_err("'text' must be a string"))?;
+
+    Ok((id, start, end, text))
 }
 
 /// Escapes special characters in text for WebVTT cue payload compliance.
@@ -133,8 +173,7 @@ fn validate_segment(segment: &Segment) -> PyResult<()> {
     }
 
     // Check for very large timestamps that could cause overflow
-    // 359999.999 seconds = 99:59:59.999 (max reasonable value)
-    if segment.start > 359999.999 || segment.end > 359999.999 {
+    if segment.start > MAX_TIMESTAMP_SECONDS || segment.end > MAX_TIMESTAMP_SECONDS {
         return Err(timestamp_error(&format!(
             "Segment {}: timestamp exceeds maximum allowed value (99:59:59.999)",
             segment.id
@@ -266,33 +305,6 @@ fn write_segments_to_vtt<W: Write>(
     Ok((index, total_offset))
 }
 
-/// Writes a NOTE block to the VTT output.
-///
-/// NOTE blocks are comments that are not displayed but can provide
-/// metadata or information for editors.
-#[allow(dead_code)]
-fn write_note_block<W: Write>(note: &str, output: &mut W) -> Result<(), std::io::Error> {
-    writeln!(output, "NOTE")?;
-    for line in note.lines() {
-        writeln!(output, "{}", line)?;
-    }
-    writeln!(output)?;
-    Ok(())
-}
-
-/// Writes a STYLE block to the VTT output.
-///
-/// STYLE blocks contain CSS rules for styling cues.
-#[allow(dead_code)]
-fn write_style_block<W: Write>(css: &str, output: &mut W) -> Result<(), std::io::Error> {
-    writeln!(output, "STYLE")?;
-    for line in css.lines() {
-        writeln!(output, "{}", line)?;
-    }
-    writeln!(output)?;
-    Ok(())
-}
-
 /// Builds a VTT file from a list of JSON files.
 ///
 /// This function reads transcript data from JSON files and generates a
@@ -419,34 +431,7 @@ fn build_vtt_from_records(
 
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
-
-        // ID is optional, defaults to index + 1
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("'start' must be a number (int or float)")
-            })?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("'end' must be a number (int or float)")
-            })?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()
-            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("'text' must be a string"))?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
         let segment = Segment {
             id,
@@ -497,21 +482,14 @@ fn validate_vtt_file(vtt_file: &str) -> PyResult<bool> {
         let header_trimmed = header.trim();
 
         // Header must be "WEBVTT" optionally followed by space/tab and text
-        if header_trimmed != "WEBVTT"
-            && !header_trimmed.starts_with("WEBVTT ")
-            && !header_trimmed.starts_with("WEBVTT\t")
-            && !header_trimmed.starts_with("WEBVTT-")
+        if header_trimmed == "WEBVTT"
+            || header_trimmed.starts_with("WEBVTT ")
+            || header_trimmed.starts_with("WEBVTT\t")
         {
+            // Valid header
+        } else {
             return Err(header_error(&format!(
-                "Missing or incorrect WEBVTT header. Got: '{}'",
-                header_trimmed
-            )));
-        }
-
-        // Special case: "WEBVTT-" prefix is NOT valid (like "WEBVTT-WRONG")
-        if header_trimmed.starts_with("WEBVTT-") {
-            return Err(header_error(&format!(
-                "Invalid WEBVTT header format. Header must be 'WEBVTT' optionally followed by space and text. Got: '{}'",
+                "Invalid WEBVTT header. Must be 'WEBVTT' optionally followed by space/tab and text. Got: '{}'",
                 header_trimmed
             )));
         }
@@ -749,33 +727,7 @@ fn escape_vtt_text_py(text: &str) -> String {
 fn validate_segments(segments_list: &Bound<'_, PyList>) -> PyResult<bool> {
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
-
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("'start' must be a number (int or float)")
-            })?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("'end' must be a number (int or float)")
-            })?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()
-            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("'text' must be a string"))?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
         let seg = Segment {
             id,
@@ -824,33 +776,7 @@ fn build_vtt_string(
 
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
-
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("'start' must be a number (int or float)")
-            })?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()
-            .map_err(|_| {
-                pyo3::exceptions::PyTypeError::new_err("'end' must be a number (int or float)")
-            })?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()
-            .map_err(|_| pyo3::exceptions::PyTypeError::new_err("'text' must be a string"))?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
         let segment = Segment {
             id,
@@ -901,26 +827,7 @@ fn merge_segments(
 
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
-
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
         segments.push(Segment {
             id,
@@ -1076,10 +983,11 @@ fn seconds_to_timestamp(seconds: f64, use_short_format: bool) -> PyResult<String
     if seconds < 0.0 {
         return Err(timestamp_error("Seconds cannot be negative"));
     }
-    if seconds > 359999.999 {
-        return Err(timestamp_error(
-            "Seconds exceeds maximum allowed value (359999.999)",
-        ));
+    if seconds > MAX_TIMESTAMP_SECONDS {
+        return Err(timestamp_error(&format!(
+            "Seconds exceeds maximum allowed value ({})",
+            MAX_TIMESTAMP_SECONDS
+        )));
     }
     Ok(format_timestamp_flexible(seconds, use_short_format))
 }
@@ -1284,26 +1192,7 @@ fn shift_timestamps(
 
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
-
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
         let new_start = start + offset_seconds;
         let new_end = end + offset_seconds;
@@ -1432,39 +1321,25 @@ fn remove_filler_words(
     let filler_list: Vec<String> =
         fillers.unwrap_or_else(|| default_fillers.iter().map(|s| s.to_string()).collect());
 
+    // Pre-compile all regex patterns once for better performance
+    let compiled_filters: Vec<regex::Regex> = filler_list
+        .iter()
+        .filter_map(|filler| {
+            let pattern = format!(r"(?i)\b{}\b", regex::escape(filler));
+            regex::Regex::new(&pattern).ok()
+        })
+        .collect();
+
     let result = PyList::empty(py);
 
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()?;
-
-        // Remove filler words (case-insensitive)
+        // Remove filler words using pre-compiled regexes
         let mut cleaned_text = text.clone();
-        for filler in &filler_list {
-            // Match filler as whole word with word boundaries
-            let pattern = format!(r"(?i)\b{}\b", regex::escape(filler));
-            if let Ok(re) = regex::Regex::new(&pattern) {
-                cleaned_text = re.replace_all(&cleaned_text, "").to_string();
-            }
+        for re in &compiled_filters {
+            cleaned_text = re.replace_all(&cleaned_text, "").to_string();
         }
 
         // Clean up multiple spaces
@@ -1847,26 +1722,7 @@ fn remove_repeated_phrases(
 
     for (idx, segment) in segments_list.iter().enumerate() {
         let segment_dict = segment.downcast::<PyDict>()?;
-
-        let id: u32 = segment_dict
-            .get_item("id")?
-            .map(|v| v.extract().unwrap_or((idx + 1) as u32))
-            .unwrap_or((idx + 1) as u32);
-
-        let start: f64 = segment_dict
-            .get_item("start")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'start' field"))?
-            .extract()?;
-
-        let end: f64 = segment_dict
-            .get_item("end")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'end' field"))?
-            .extract()?;
-
-        let text: String = segment_dict
-            .get_item("text")?
-            .ok_or_else(|| pyo3::exceptions::PyKeyError::new_err("Missing 'text' field"))?
-            .extract()?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
 
         // Remove repeated phrases
         let words: Vec<&str> = text.split_whitespace().collect();
@@ -2074,4 +1930,219 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_function(wrap_pyfunction!(detect_chapters, m)?)?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_escape_vtt_text() {
+        assert_eq!(escape_vtt_text("plain text"), "plain text");
+        assert_eq!(escape_vtt_text("a & b"), "a &amp; b");
+        assert_eq!(escape_vtt_text("<tag>"), "&lt;tag&gt;");
+        assert_eq!(escape_vtt_text("a --> b"), "a --&gt; b");
+        assert_eq!(escape_vtt_text("&<>"), "&amp;&lt;&gt;");
+        assert_eq!(escape_vtt_text("Tom & Jerry <3"), "Tom &amp; Jerry &lt;3");
+    }
+
+    #[test]
+    fn test_unescape_vtt_text() {
+        assert_eq!(unescape_vtt_text("plain text"), "plain text");
+        assert_eq!(unescape_vtt_text("a &amp; b"), "a & b");
+        assert_eq!(unescape_vtt_text("&lt;tag&gt;"), "<tag>");
+        assert_eq!(unescape_vtt_text("a --&gt; b"), "a --> b");
+        assert_eq!(unescape_vtt_text("&nbsp;"), "\u{00A0}");
+        assert_eq!(unescape_vtt_text("&lrm;"), "\u{200E}");
+        assert_eq!(unescape_vtt_text("&rlm;"), "\u{200F}");
+    }
+
+    #[test]
+    fn test_format_timestamp_flexible_long_format() {
+        assert_eq!(format_timestamp_flexible(0.0, false), "00:00:00.000");
+        assert_eq!(format_timestamp_flexible(1.0, false), "00:00:01.000");
+        assert_eq!(format_timestamp_flexible(61.5, false), "00:01:01.500");
+        assert_eq!(format_timestamp_flexible(3661.999, false), "01:01:01.999");
+        assert_eq!(format_timestamp_flexible(3600.0, false), "01:00:00.000");
+    }
+
+    #[test]
+    fn test_format_timestamp_flexible_short_format() {
+        assert_eq!(format_timestamp_flexible(0.0, true), "00:00.000");
+        assert_eq!(format_timestamp_flexible(1.0, true), "00:01.000");
+        assert_eq!(format_timestamp_flexible(61.5, true), "01:01.500");
+        assert_eq!(format_timestamp_flexible(599.999, true), "09:59.999");
+        // When hours > 0, should use long format even with short=true
+        assert_eq!(format_timestamp_flexible(3661.0, true), "01:01:01.000");
+    }
+
+    #[test]
+    fn test_is_valid_timestamp() {
+        // Valid long format
+        assert!(is_valid_timestamp("00:00:00.000"));
+        assert!(is_valid_timestamp("01:23:45.678"));
+        assert!(is_valid_timestamp("99:59:59.999"));
+
+        // Valid short format
+        assert!(is_valid_timestamp("00:00.000"));
+        assert!(is_valid_timestamp("01:30.500"));
+        assert!(is_valid_timestamp("59:59.999"));
+
+        // Invalid: missing milliseconds
+        assert!(!is_valid_timestamp("00:00:00"));
+        assert!(!is_valid_timestamp("00:00"));
+
+        // Invalid: wrong millisecond length
+        assert!(!is_valid_timestamp("00:00:00.0"));
+        assert!(!is_valid_timestamp("00:00:00.00"));
+        assert!(!is_valid_timestamp("00:00:00.0000"));
+
+        // Invalid: seconds > 59
+        assert!(!is_valid_timestamp("00:00:60.000"));
+        assert!(!is_valid_timestamp("00:60.000"));
+
+        // Invalid: minutes > 59 in long format
+        assert!(!is_valid_timestamp("00:60:00.000"));
+
+        // Invalid: wrong separator
+        assert!(!is_valid_timestamp("00-00-00.000"));
+    }
+
+    #[test]
+    fn test_validate_segment_success() {
+        let segment = Segment {
+            id: 1,
+            start: 0.0,
+            end: 2.5,
+            text: "Valid text".to_string(),
+        };
+        assert!(validate_segment(&segment).is_ok());
+    }
+
+    #[test]
+    fn test_validate_segment_negative_start() {
+        let segment = Segment {
+            id: 1,
+            start: -1.0,
+            end: 2.5,
+            text: "Text".to_string(),
+        };
+        assert!(validate_segment(&segment).is_err());
+    }
+
+    #[test]
+    fn test_validate_segment_negative_end() {
+        let segment = Segment {
+            id: 1,
+            start: 0.0,
+            end: -1.0,
+            text: "Text".to_string(),
+        };
+        assert!(validate_segment(&segment).is_err());
+    }
+
+    #[test]
+    fn test_validate_segment_end_before_start() {
+        let segment = Segment {
+            id: 1,
+            start: 5.0,
+            end: 2.5,
+            text: "Text".to_string(),
+        };
+        assert!(validate_segment(&segment).is_err());
+    }
+
+    #[test]
+    fn test_validate_segment_empty_text() {
+        let segment = Segment {
+            id: 1,
+            start: 0.0,
+            end: 2.5,
+            text: "   ".to_string(),
+        };
+        assert!(validate_segment(&segment).is_err());
+    }
+
+    #[test]
+    fn test_validate_segment_max_timestamp() {
+        let segment = Segment {
+            id: 1,
+            start: 0.0,
+            end: MAX_TIMESTAMP_SECONDS,
+            text: "Text".to_string(),
+        };
+        assert!(validate_segment(&segment).is_ok());
+
+        let segment_over = Segment {
+            id: 1,
+            start: 0.0,
+            end: MAX_TIMESTAMP_SECONDS + 1.0,
+            text: "Text".to_string(),
+        };
+        assert!(validate_segment(&segment_over).is_err());
+    }
+
+    #[test]
+    fn test_validate_segment_arrow_in_text() {
+        let segment = Segment {
+            id: 1,
+            start: 0.0,
+            end: 2.5,
+            text: "Text with --> arrow".to_string(),
+        };
+        assert!(validate_segment(&segment).is_err());
+    }
+
+    #[test]
+    fn test_prepare_cue_text_flatten_newlines() {
+        let config = VttConfig {
+            escape_special_chars: false,
+            flatten_newlines: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            prepare_cue_text("Line 1\nLine 2\rLine 3\tLine 4", &config),
+            "Line 1 Line 2 Line 3 Line 4"
+        );
+    }
+
+    #[test]
+    fn test_prepare_cue_text_preserve_newlines() {
+        let config = VttConfig {
+            escape_special_chars: false,
+            flatten_newlines: false,
+            ..Default::default()
+        };
+        let result = prepare_cue_text("Line 1\nLine 2", &config);
+        assert!(result.contains("Line 1"));
+        assert!(result.contains("Line 2"));
+    }
+
+    #[test]
+    fn test_prepare_cue_text_escape() {
+        let config = VttConfig {
+            escape_special_chars: true,
+            flatten_newlines: true,
+            ..Default::default()
+        };
+        assert_eq!(prepare_cue_text("Tom & Jerry", &config), "Tom &amp; Jerry");
+    }
+
+    #[test]
+    fn test_prepare_cue_text_no_escape() {
+        let config = VttConfig {
+            escape_special_chars: false,
+            flatten_newlines: true,
+            ..Default::default()
+        };
+        assert_eq!(prepare_cue_text("Tom & Jerry", &config), "Tom & Jerry");
+    }
+
+    #[test]
+    fn test_format_timestamp_internal() {
+        assert_eq!(format_timestamp_internal(0.0), "00:00");
+        assert_eq!(format_timestamp_internal(90.0), "01:30");
+        assert_eq!(format_timestamp_internal(3661.0), "01:01:01");
+        assert_eq!(format_timestamp_internal(59.0), "00:59");
+    }
 }
