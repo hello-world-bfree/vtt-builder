@@ -1,13 +1,11 @@
-name: CI
+name: Build Multi-Platform Wheels
 
 on:
   push:
-    branches:
-      - main
-      - master
     tags:
-      - '*'
-  pull_request:
+      - 'v*.*.*'
+  release:
+    types: [published]
   workflow_dispatch:
     inputs:
       run_linux:
@@ -35,6 +33,11 @@ on:
         required: false
         default: 'true'
         type: boolean
+      publish_to_pypi:
+        description: 'Publish to PyPI after building'
+        required: false
+        default: 'false'
+        type: boolean
       linux_targets:
         description: 'Linux targets to build (comma-separated)'
         required: false
@@ -58,6 +61,8 @@ on:
 
 permissions:
   contents: read
+  id-token: write
+  attestations: write
 
 jobs:
   prepare:
@@ -119,19 +124,19 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.prepare.outputs.linux-matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
+      - uses: actions/setup-python@v5  # TODO: Pin to commit SHA
         with:
           python-version: 3.12
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: auto
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4  # TODO: Pin to commit SHA
         with:
           name: wheels-linux-${{ matrix.platform.target }}
           path: dist
@@ -145,19 +150,19 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.prepare.outputs.musllinux-matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
+      - uses: actions/setup-python@v5  # TODO: Pin to commit SHA
         with:
           python-version: 3.12
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
           manylinux: musllinux_1_2
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4  # TODO: Pin to commit SHA
         with:
           name: wheels-musllinux-${{ matrix.platform.target }}
           path: dist
@@ -171,19 +176,19 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.prepare.outputs.windows-matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
+      - uses: actions/setup-python@v5  # TODO: Pin to commit SHA
         with:
           python-version: 3.12
           architecture: ${{ matrix.platform.target }}
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4  # TODO: Pin to commit SHA
         with:
           name: wheels-windows-${{ matrix.platform.target }}
           path: dist
@@ -197,18 +202,18 @@ jobs:
       matrix:
         platform: ${{ fromJson(needs.prepare.outputs.macos-matrix) }}
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v5
+      - uses: actions/checkout@v4  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
+      - uses: actions/setup-python@v5  # TODO: Pin to commit SHA
         with:
           python-version: 3.12
       - name: Build wheels
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
         with:
           target: ${{ matrix.platform.target }}
           args: --release --out dist --find-interpreter
           sccache: ${{ !startsWith(github.ref, 'refs/tags/') }}
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4  # TODO: Pin to commit SHA
         with:
           name: wheels-macos-${{ matrix.platform.target }}
           path: dist
@@ -217,14 +222,101 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ (github.event_name != 'workflow_dispatch') || (inputs.run_sdist == true) }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v4  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
       - name: Build sdist
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
         with:
           command: sdist
           args: --out dist
       - name: Upload sdist
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v4  # TODO: Pin to commit SHA
         with:
           name: wheels-sdist
           path: dist
+
+  release:
+    name: Release to PyPI
+    runs-on: ubuntu-latest
+    needs: [linux, musllinux, windows, macos, sdist]
+    if: |
+      always() &&
+      !cancelled() &&
+      !contains(needs.*.result, 'failure') &&
+      (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi == true))
+    environment:
+      name: pypi
+      url: https://pypi.org/project/vtt-builder/
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4  # TODO: Pin to commit SHA
+        with:
+          pattern: wheels-*
+          merge-multiple: true
+
+      - name: List downloaded artifacts
+        run: |
+          find . -name "*.whl" -o -name "*.tar.gz" | sort
+
+      - name: Verify artifact versions
+        if: github.event_name == 'release'
+        run: |
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          VERSION="${RELEASE_TAG#v}"
+
+          echo "Release tag: $RELEASE_TAG"
+          echo "Expected version: $VERSION"
+
+          # Check all wheels contain the correct version
+          for wheel in *.whl; do
+            if [[ ! "$wheel" =~ vtt_builder-${VERSION}- ]]; then
+              echo "ERROR: Wheel $wheel does not match release version $VERSION"
+              exit 1
+            fi
+          done
+
+          # Check sdist contains the correct version
+          for tarball in *.tar.gz; do
+            if [[ ! "$tarball" =~ vtt_builder-${VERSION}\.tar\.gz ]]; then
+              echo "ERROR: Source distribution $tarball does not match release version $VERSION"
+              exit 1
+            fi
+          done
+
+          echo "✓ All artifacts match release version $VERSION"
+
+      - name: Verify build reproducibility
+        run: |
+          echo "Checking for duplicate wheels across platforms..."
+
+          # Get unique wheel filenames (excluding platform-specific parts)
+          wheels=$(find . -name "*.whl" -exec basename {} \; | sort)
+
+          # Count wheels per Python version and platform
+          echo "Built wheels:"
+          echo "$wheels" | sed 's/^/  /'
+
+          wheel_count=$(echo "$wheels" | wc -l)
+          echo ""
+          echo "Total wheels: $wheel_count"
+
+          # Verify we have wheels for all expected platforms
+          platforms=("manylinux" "musllinux" "win_amd64" "win32" "macosx")
+          for platform in "${platforms[@]}"; do
+            count=$(echo "$wheels" | grep -c "$platform" || true)
+            if [ "$count" -gt 0 ]; then
+              echo "✓ Found $count wheel(s) for $platform"
+            fi
+          done
+
+      - name: Generate artifact attestation
+        uses: actions/attest-build-provenance@v2  # TODO: Pin to commit SHA
+        with:
+          subject-path: '**/*.whl'
+
+      - name: Publish to PyPI
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
+        env:
+          MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
+        with:
+          command: upload
+          args: --non-interactive --skip-existing **/*.whl **/*.tar.gz
