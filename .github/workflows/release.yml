@@ -21,7 +21,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Get artifacts from CI run
-        uses: actions/github-script@v7
+        uses: actions/github-script@v7  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
         id: get-run-id
         with:
           script: |
@@ -51,7 +51,7 @@ jobs:
             return latestRun.id;
 
       - name: Download artifacts from CI run
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v4  # TODO: Pin to commit SHA
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
           run-id: ${{ steps.get-run-id.outputs.result }}
@@ -61,13 +61,40 @@ jobs:
         run: |
           find . -name "*.whl" -o -name "*.tar.gz" | sort
 
+      - name: Verify artifact versions
+        if: github.event_name == 'release'
+        run: |
+          RELEASE_TAG="${{ github.event.release.tag_name }}"
+          VERSION="${RELEASE_TAG#v}"
+
+          echo "Release tag: $RELEASE_TAG"
+          echo "Expected version: $VERSION"
+
+          # Check all wheels contain the correct version
+          for wheel in *.whl; do
+            if [[ ! "$wheel" =~ vtt_builder-${VERSION}- ]]; then
+              echo "ERROR: Wheel $wheel does not match release version $VERSION"
+              exit 1
+            fi
+          done
+
+          # Check sdist contains the correct version
+          for tarball in *.tar.gz; do
+            if [[ ! "$tarball" =~ vtt_builder-${VERSION}\.tar\.gz ]]; then
+              echo "ERROR: Source distribution $tarball does not match release version $VERSION"
+              exit 1
+            fi
+          done
+
+          echo "✓ All artifacts match release version $VERSION"
+
       - name: Generate artifact attestation
-        uses: actions/attest-build-provenance@v2
+        uses: actions/attest-build-provenance@v2  # TODO: Pin to commit SHA
         with:
           subject-path: '**/*.whl'
 
       - name: Publish to PyPI
-        uses: PyO3/maturin-action@v1
+        uses: PyO3/maturin-action@v1  # TODO: Pin to commit SHA
         env:
           MATURIN_PYPI_TOKEN: ${{ secrets.PYPI_API_TOKEN }}
         with:
