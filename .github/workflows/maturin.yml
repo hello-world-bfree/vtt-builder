@@ -54,9 +54,9 @@ on:
         default: 'x64,x86'
         type: string
       macos_targets:
-        description: 'macOS targets to build (comma-separated)'
+        description: 'macOS targets to build (comma-separated; x86_64 has no live runner)'
         required: false
-        default: 'x86_64,aarch64'
+        default: 'aarch64'
         type: string
 
 permissions:
@@ -109,10 +109,15 @@ jobs:
           if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
             macos_targets="${{ inputs.macos_targets }}"
           else
-            macos_targets="x86_64,aarch64"
+            macos_targets="aarch64"
           fi
-          
-          macos_matrix=$(echo "$macos_targets" | jq -R -c 'split(",") | map(select(. == "x86_64") | {"runner": "macos-13", "target": .}) + map(select(. == "aarch64") | {"runner": "macos-14", "target": .})')
+
+          # Intel macOS (x86_64) is not built. Its runner label macos-13 was
+          # retired, and jobs targeting a retired label queue forever instead of
+          # failing fast, which stalled the whole release. Apple Silicon wheels
+          # still ship; Intel Mac users install from the sdist. Re-add an x86_64
+          # entry here (on a live Intel label) if that changes.
+          macos_matrix=$(echo "$macos_targets" | jq -R -c 'split(",") | map(select(. == "aarch64") | {"runner": "macos-14", "target": .})')
           echo "macos-matrix=$macos_matrix" >> $GITHUB_OUTPUT
 
   linux:
