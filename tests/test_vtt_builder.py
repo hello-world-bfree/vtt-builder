@@ -7,12 +7,14 @@ from vtt_builder import (
     VttCueError,
     VttError,
     VttHeaderError,
+    VttSequenceError,
     VttTimestampError,
     VttValidationError,
     build_transcript_from_json_files,
     build_vtt_from_json_files,
     build_vtt_from_records,
     build_vtt_string,
+    clamp_to_duration,
     detect_chapters,
     escape_vtt_text,
     filter_by_confidence,
@@ -20,6 +22,8 @@ from vtt_builder import (
     get_segments_stats,
     group_by_speaker,
     merge_segments,
+    parse_vtt_file,
+    parse_vtt_string,
     remove_filler_words,
     remove_repeated_phrases,
     seconds_to_timestamp,
@@ -27,6 +31,7 @@ from vtt_builder import (
     split_long_segments,
     timestamp_to_seconds,
     unescape_vtt_text,
+    validate_cue_sequence,
     validate_segments,
     validate_vtt_file,
     words_to_segments,
@@ -813,11 +818,23 @@ class TestEdgeCases:
         assert "WEBVTT" in content
         assert "1\n00:00:00.000 --> 00:00:02.000\nOnly segment" in content
 
-    def test_zero_duration_segment(self, temp_output_file):
-        """Test segment with zero duration."""
+    def test_zero_duration_segment_rejected(self, temp_output_file):
+        """A zero-duration cue is rejected because it is never displayed.
+
+        Changed in 0.6.0: this input previously produced a file containing a
+        cue that no player would ever show. Sequence validation now rejects it,
+        so the malformed output is surfaced as an error instead of written.
+        """
         segments = [{"id": 1, "start": 1.0, "end": 1.0, "text": "Zero duration"}]
 
-        build_vtt_from_records(segments, temp_output_file)
+        with pytest.raises(VttSequenceError):
+            build_vtt_from_records(segments, temp_output_file)
+
+    def test_zero_duration_segment_written_when_validation_disabled(self, temp_output_file):
+        """The opt-out preserves the pre-0.6.0 behavior exactly."""
+        segments = [{"id": 1, "start": 1.0, "end": 1.0, "text": "Zero duration"}]
+
+        build_vtt_from_records(segments, temp_output_file, validate_segments=False)
 
         with open(temp_output_file) as f:
             content = f.read()
@@ -1658,6 +1675,591 @@ class TestDetectChapters:
         """Test with empty segments list."""
         result = detect_chapters([])
         assert result == []
+
+
+class TestParseVttString:
+    def test_basic_parse(self):
+        vtt = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.500\nHello world\n\n2\n00:00:02.500 --> 00:00:05.000\nThis is a test\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 2
+        assert result[0]["id"] == 1
+        assert result[0]["start"] == 0.0
+        assert result[0]["end"] == 2.5
+        assert result[0]["text"] == "Hello world"
+        assert result[1]["id"] == 2
+        assert result[1]["start"] == 2.5
+        assert result[1]["end"] == 5.0
+        assert result[1]["text"] == "This is a test"
+
+    def test_without_cue_identifiers(self):
+        vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nHello world\n\n00:00:02.500 --> 00:00:05.000\nSecond cue\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 2
+        assert result[0]["text"] == "Hello world"
+        assert result[1]["text"] == "Second cue"
+
+    def test_short_timestamp_format(self):
+        vtt = "WEBVTT\n\n00:00.000 --> 00:02.500\nShort format\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+        assert result[0]["start"] == 0.0
+        assert result[0]["end"] == 2.5
+
+    def test_multiline_cue_text(self):
+        vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nLine one\nLine two\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+        assert result[0]["text"] == "Line one\nLine two"
+
+    def test_unescape_entities(self):
+        vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nTom &amp; Jerry &lt;3\n"
+        result = parse_vtt_string(vtt)
+        assert result[0]["text"] == "Tom & Jerry <3"
+
+    def test_unescape_disabled(self):
+        vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.500\nTom &amp; Jerry\n"
+        result = parse_vtt_string(vtt, unescape=False)
+        assert result[0]["text"] == "Tom &amp; Jerry"
+
+    def test_skips_note_blocks(self):
+        vtt = "WEBVTT\n\nNOTE This is a comment\nspanning multiple lines\n\n00:00:00.000 --> 00:00:02.500\nActual cue\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+        assert result[0]["text"] == "Actual cue"
+
+    def test_skips_style_blocks(self):
+        vtt = "WEBVTT\n\nSTYLE\n::cue { color: white; }\n\n00:00:00.000 --> 00:00:02.500\nStyled cue\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+        assert result[0]["text"] == "Styled cue"
+
+    def test_header_with_description(self):
+        vtt = "WEBVTT - My Description\n\n00:00:00.000 --> 00:00:02.500\nHello\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+
+    def test_header_with_metadata(self):
+        vtt = "WEBVTT\nKind: captions\nLanguage: en\n\n00:00:00.000 --> 00:00:02.500\nHello\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+
+    def test_invalid_header(self):
+        vtt = "NOT A VTT FILE\n\n00:00:00.000 --> 00:00:02.500\nHello\n"
+        with pytest.raises(VttHeaderError):
+            parse_vtt_string(vtt)
+
+    def test_empty_input(self):
+        with pytest.raises(VttHeaderError):
+            parse_vtt_string("")
+
+    def test_sequential_ids(self):
+        vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:01.000\nFirst\n\n00:00:01.000 --> 00:00:02.000\nSecond\n\n00:00:02.000 --> 00:00:03.000\nThird\n"
+        result = parse_vtt_string(vtt)
+        assert [s["id"] for s in result] == [1, 2, 3]
+
+    def test_cue_settings_ignored(self):
+        vtt = "WEBVTT\n\n00:00:00.000 --> 00:00:02.500 position:50% align:center\nPositioned cue\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+        assert result[0]["end"] == 2.5
+
+    def test_bom_header(self):
+        vtt = "\ufeffWEBVTT\n\n00:00:00.000 --> 00:00:02.500\nBOM test\n"
+        result = parse_vtt_string(vtt)
+        assert len(result) == 1
+
+
+class TestParseVttFile:
+    def test_basic_parse(self):
+        vtt_content = "WEBVTT\n\n1\n00:00:00.000 --> 00:00:02.500\nHello world\n\n2\n00:00:02.500 --> 00:00:05.000\nThis is a test\n"
+        with tempfile.NamedTemporaryFile(mode="w", suffix=".vtt", delete=False) as f:
+            f.write(vtt_content)
+            f.flush()
+            result = parse_vtt_file(f.name)
+        os.unlink(f.name)
+        assert len(result) == 2
+        assert result[0]["text"] == "Hello world"
+        assert result[1]["text"] == "This is a test"
+
+    def test_file_not_found(self):
+        with pytest.raises(IOError):
+            parse_vtt_file("/nonexistent/path.vtt")
+
+    def test_roundtrip(self):
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.5, "text": "Hello world"},
+            {"id": 2, "start": 2.5, "end": 5.0, "text": "This is a test"},
+        ]
+        vtt_output = build_vtt_string(segments)
+        result = parse_vtt_string(vtt_output)
+        assert len(result) == 2
+        assert result[0]["start"] == segments[0]["start"]
+        assert result[0]["end"] == segments[0]["end"]
+        assert result[0]["text"] == segments[0]["text"]
+        assert result[1]["start"] == segments[1]["start"]
+        assert result[1]["end"] == segments[1]["end"]
+        assert result[1]["text"] == segments[1]["text"]
+
+    def test_roundtrip_with_escaping(self):
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.5, "text": "Tom & Jerry <3"},
+        ]
+        vtt_output = build_vtt_string(segments, escape_text=True)
+        result = parse_vtt_string(vtt_output, unescape=True)
+        assert result[0]["text"] == "Tom & Jerry <3"
+
+
+class TestValidateCueSequence:
+    """Cross-cue sequence validation: ordering, overlap, gaps, duration bounds.
+
+    These duplicate the Rust unit tests in src/lib.rs deliberately. The crate is
+    cdylib-only with pyo3's extension-module feature, so `cargo test` cannot link
+    and the Rust tests never execute; this layer is what actually verifies the
+    behavior.
+    """
+
+    def test_ordered_disjoint_sequence_passes(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 3.0, "end": 5.0, "text": "Two"},
+            {"start": 6.0, "end": 8.0, "text": "Three"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+    def test_overlapping_pair_rejected(self):
+        """The silent-corruption case this whole feature exists to surface."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments)
+
+    def test_out_of_order_pair_rejected(self):
+        segments = [
+            {"start": 10.0, "end": 12.0, "text": "Later"},
+            {"start": 2.0, "end": 4.0, "text": "Earlier"},
+        ]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments)
+
+    def test_exact_abutment_passes(self):
+        """Normal chunker output; rejecting it would fail every good transcript."""
+        segments = [
+            {"start": 0.0, "end": 2.5, "text": "One"},
+            {"start": 2.5, "end": 5.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+    def test_zero_length_cue_rejected(self):
+        segments = [{"start": 1.0, "end": 1.0, "text": "Never displayed"}]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments)
+
+    def test_empty_and_single_lists_pass(self):
+        """No cue pair exists, so no pair can conflict."""
+        assert validate_cue_sequence([]) is True
+        assert validate_cue_sequence([{"start": 0.0, "end": 2.0, "text": "Solo"}]) is True
+
+    def test_gap_below_minimum_rejected(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 2.05, "end": 4.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments, min_gap=0.1)
+
+    def test_gap_meeting_minimum_passes(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 2.2, "end": 4.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments, min_gap=0.1) is True
+
+    def test_abutting_cues_pass_without_min_gap(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 2.0, "end": 4.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+    def test_cue_ending_after_duration_rejected(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 3.0, "end": 12.0, "text": "Overruns"},
+        ]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments, audio_duration=10.0)
+
+    def test_cue_starting_past_duration_rejected(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 11.0, "end": 12.0, "text": "Past the end"},
+        ]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments, audio_duration=10.0)
+
+    def test_cues_within_duration_pass(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 3.0, "end": 10.0, "text": "Ends exactly at duration"},
+        ]
+        assert validate_cue_sequence(segments, audio_duration=10.0) is True
+
+    def test_error_message_locates_the_bad_pair(self):
+        """A failure must be actionable from a log line alone."""
+        segments = [
+            {"id": 7, "start": 0.0, "end": 5.0, "text": "One"},
+            {"id": 8, "start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError) as exc_info:
+            validate_cue_sequence(segments)
+
+        message = str(exc_info.value)
+        assert "7" in message, message
+        assert "8" in message, message
+        assert "3" in message, message
+        assert "5" in message, message
+
+
+class TestCueSequenceQuantization:
+    """Comparisons happen at millisecond precision, not on raw floats.
+
+    These pin the decision to quantize: without them a refactor back to f64
+    comparison would pass the suite while making exact abutment depend on
+    whichever arithmetic produced each timestamp.
+    """
+
+    def test_abutment_survives_floating_point_arithmetic(self):
+        """0.1 * 3 is 0.30000000000000004, but both quantize to 300ms."""
+        drifted_end = 0.1 + 0.1 + 0.1
+        assert drifted_end != 0.3  # the drift is real
+        segments = [
+            {"start": 0.0, "end": drifted_end, "text": "One"},
+            {"start": 0.3, "end": 1.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+    def test_sub_millisecond_overlap_ignored(self):
+        """An overlap too small to serialize cannot affect a player."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 1.9999, "end": 4.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+    def test_cue_zero_length_only_after_quantization_rejected(self):
+        """Spans 0.0001s, which serializes to a zero-length cue."""
+        segments = [{"start": 1.0, "end": 1.0001, "text": "Vanishes"}]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(segments)
+
+    def test_min_gap_zero_admits_abutting_cues(self):
+        """Gap comparison is strictly less-than."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 2.0, "end": 4.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments, min_gap=0.0) is True
+
+    def test_quantization_agrees_with_written_timestamps(self):
+        """The validator must agree with the write path about what a time is."""
+        boundary = 2.0004
+        assert seconds_to_timestamp(boundary) == "00:00:02.000"
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": boundary, "end": 4.0, "text": "Two"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+    def test_long_duration_timestamps_compare_correctly(self):
+        """Float spacing grows with magnitude; quantization must not drift.
+
+        A fixed epsilon would behave differently here than near zero, which is
+        the reason milliseconds were chosen over an epsilon.
+        """
+        segments = [
+            {"start": 7200.0, "end": 7202.5, "text": "Two hours in"},
+            {"start": 7202.5, "end": 7205.0, "text": "Abuts exactly"},
+        ]
+        assert validate_cue_sequence(segments) is True
+
+        overlapping = [
+            {"start": 7200.0, "end": 7205.0, "text": "Two hours in"},
+            {"start": 7202.5, "end": 7207.0, "text": "Overlaps"},
+        ]
+        with pytest.raises(VttSequenceError):
+            validate_cue_sequence(overlapping)
+
+
+class TestSequenceErrorHierarchy:
+    """VttSequenceError must be distinguishable but still broadly catchable."""
+
+    def test_caught_by_validation_error(self):
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttValidationError):
+            validate_cue_sequence(segments)
+
+    def test_caught_by_base_error(self):
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttError):
+            validate_cue_sequence(segments)
+
+    def test_sequence_error_is_a_subclass_of_validation_error(self):
+        assert issubclass(VttSequenceError, VttValidationError)
+        assert issubclass(VttSequenceError, VttError)
+
+    def test_single_cue_faults_do_not_raise_sequence_error(self):
+        """A per-cue fault must stay distinguishable from a sequence fault."""
+        negative = [{"start": -1.0, "end": 2.0, "text": "Negative"}]
+        with pytest.raises(VttTimestampError):
+            validate_segments(negative)
+        assert not issubclass(VttTimestampError, VttSequenceError)
+
+        empty_text = [{"start": 0.0, "end": 2.0, "text": "   "}]
+        with pytest.raises(VttCueError):
+            validate_segments(empty_text)
+        assert not issubclass(VttCueError, VttSequenceError)
+
+    def test_sequence_fault_not_caught_by_per_cue_error_types(self):
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            try:
+                validate_cue_sequence(segments)
+            except (VttTimestampError, VttCueError):  # pragma: no cover
+                pytest.fail("sequence fault raised a per-cue error type")
+
+
+class TestBuildersRejectBadSequences:
+    """Builders must not write a file whose cues are collectively malformed."""
+
+    def test_file_builder_rejects_overlap(self, temp_output_file):
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            build_vtt_from_records(segments, temp_output_file)
+
+    def test_no_file_left_behind_after_rejection(self, temp_output_file):
+        """A failed build must not be mistakable for a successful one."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            build_vtt_from_records(segments, temp_output_file)
+
+        assert not os.path.exists(temp_output_file)
+
+    def test_existing_file_survives_a_rejected_build(self, temp_output_file):
+        """The case a caller is most likely to hit: rebuilding over a good file."""
+        good = [
+            {"start": 0.0, "end": 2.0, "text": "Original content"},
+        ]
+        build_vtt_from_records(good, temp_output_file)
+        with open(temp_output_file) as f:
+            original = f.read()
+
+        bad = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            build_vtt_from_records(bad, temp_output_file)
+
+        with open(temp_output_file) as f:
+            assert f.read() == original
+
+    def test_no_temp_file_left_in_destination_directory(self, temp_output_file):
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        directory = os.path.dirname(temp_output_file)
+        before = set(os.listdir(directory))
+
+        with pytest.raises(VttSequenceError):
+            build_vtt_from_records(segments, temp_output_file)
+
+        leftover = set(os.listdir(directory)) - before
+        assert not leftover, f"temp files left behind: {leftover}"
+
+    def test_string_builder_rejects_overlap(self):
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        with pytest.raises(VttSequenceError):
+            build_vtt_string(segments)
+
+    def test_file_builder_opt_out_writes_overlap(self, temp_output_file):
+        """validate_segments=False preserves the pre-0.6.0 behavior exactly."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        build_vtt_from_records(segments, temp_output_file, validate_segments=False)
+
+        with open(temp_output_file) as f:
+            content = f.read()
+        assert "00:00:03.000 --> 00:00:07.000" in content
+
+    def test_string_builder_opt_out_writes_overlap(self):
+        """Note this builder names its flag `validate`, not `validate_segments`."""
+        segments = [
+            {"start": 0.0, "end": 5.0, "text": "One"},
+            {"start": 3.0, "end": 7.0, "text": "Two"},
+        ]
+        result = build_vtt_string(segments, validate=False)
+        assert "00:00:03.000 --> 00:00:07.000" in result
+
+    def test_valid_sequence_still_builds_unchanged(self, temp_output_file):
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.0, "text": "Hello world"},
+            {"id": 2, "start": 2.0, "end": 4.0, "text": "This is a test"},
+        ]
+        build_vtt_from_records(segments, temp_output_file)
+
+        with open(temp_output_file) as f:
+            content = f.read()
+        assert "WEBVTT" in content
+        assert "1\n00:00:00.000 --> 00:00:02.000\nHello world" in content
+        assert "2\n00:00:02.000 --> 00:00:04.000\nThis is a test" in content
+
+    def test_json_files_builder_does_not_check_cross_file_ordering(self, temp_output_file):
+        """Documented limit: it streams files and never sees the whole sequence.
+
+        Pinned so it cannot be "fixed" into a half-guarantee that covers only
+        within-file ordering — cross-file boundaries are where a bad offset
+        actually shows up.
+        """
+        first = {
+            "transcript": "First",
+            "segments": [{"id": 1, "start": 0.0, "end": 9.0, "text": "First file"}],
+        }
+        second = {
+            "transcript": "Second",
+            "segments": [{"id": 1, "start": 0.0, "end": 3.0, "text": "Second file"}],
+        }
+
+        paths = []
+        for payload in (first, second):
+            with tempfile.NamedTemporaryFile(mode="w", suffix=".json", delete=False) as f:
+                json.dump(payload, f)
+                paths.append(f.name)
+
+        try:
+            build_vtt_from_json_files(paths, temp_output_file)
+            assert os.path.exists(temp_output_file)
+        finally:
+            for path in paths:
+                os.unlink(path)
+
+
+class TestClampToDuration:
+    """Bounding cues to a media duration, so callers can correct not just detect."""
+
+    def test_overrunning_cue_is_truncated(self):
+        segments = [{"start": 2.0, "end": 9.0, "text": "Overruns"}]
+        result = clamp_to_duration(segments, 5.0)
+
+        assert len(result) == 1
+        assert result[0]["start"] == 2.0
+        assert result[0]["end"] == 5.0
+
+    def test_cue_starting_past_duration_is_dropped(self):
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "Kept"},
+            {"start": 12.0, "end": 14.0, "text": "Dropped"},
+        ]
+        result = clamp_to_duration(segments, 5.0)
+
+        assert len(result) == 1
+        assert result[0]["text"] == "Kept"
+
+    def test_cue_starting_exactly_at_duration_is_dropped(self):
+        segments = [{"start": 5.0, "end": 7.0, "text": "At the boundary"}]
+        assert clamp_to_duration(segments, 5.0) == []
+
+    def test_in_range_cues_are_unchanged(self):
+        segments = [
+            {"id": 1, "start": 0.0, "end": 2.0, "text": "One"},
+            {"id": 2, "start": 2.5, "end": 4.0, "text": "Two"},
+        ]
+        result = clamp_to_duration(segments, 10.0)
+
+        assert len(result) == 2
+        assert result[0]["start"] == 0.0
+        assert result[0]["end"] == 2.0
+        assert result[1]["start"] == 2.5
+        assert result[1]["end"] == 4.0
+
+    def test_ids_are_renumbered_sequentially(self):
+        segments = [
+            {"id": 5, "start": 0.0, "end": 2.0, "text": "One"},
+            {"id": 9, "start": 2.5, "end": 4.0, "text": "Two"},
+        ]
+        result = clamp_to_duration(segments, 10.0)
+        assert [seg["id"] for seg in result] == [1, 2]
+
+    def test_extra_keys_are_dropped(self):
+        """Matches merge_segments: no transformation preserves extra keys."""
+        segments = [
+            {
+                "start": 0.0,
+                "end": 2.0,
+                "text": "One",
+                "speaker": "Alice",
+                "confidence": 0.9,
+            }
+        ]
+        result = clamp_to_duration(segments, 10.0)
+
+        assert set(result[0].keys()) == {"id", "start", "end", "text"}
+
+    def test_empty_list_returns_empty(self):
+        assert clamp_to_duration([], 10.0) == []
+
+    def test_all_cues_past_duration_returns_empty(self):
+        segments = [
+            {"start": 20.0, "end": 22.0, "text": "One"},
+            {"start": 23.0, "end": 25.0, "text": "Two"},
+        ]
+        assert clamp_to_duration(segments, 10.0) == []
+
+    def test_clamped_output_passes_sequence_validation(self):
+        """The round trip that makes this useful: clamp, then assert."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 2.5, "end": 4.0, "text": "Two"},
+            {"start": 4.5, "end": 12.0, "text": "Overruns"},
+            {"start": 15.0, "end": 17.0, "text": "Past the end"},
+        ]
+        clamped = clamp_to_duration(segments, 10.0)
+
+        assert validate_cue_sequence(clamped, audio_duration=10.0) is True
+
+    def test_clamped_output_builds_successfully(self):
+        """Clamping is the documented fix for a duration-overrun rejection."""
+        segments = [
+            {"start": 0.0, "end": 2.0, "text": "One"},
+            {"start": 2.5, "end": 12.0, "text": "Overruns"},
+        ]
+        clamped = clamp_to_duration(segments, 10.0)
+        result = build_vtt_string(clamped)
+
+        assert "WEBVTT" in result
+        assert "00:00:02.500 --> 00:00:10.000" in result
 
 
 if __name__ == "__main__":

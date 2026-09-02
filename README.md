@@ -569,10 +569,87 @@ build_vtt_from_records(segments, "podcast_episode.vtt")
 - Python 3.8+
 - Rust toolchain (for building from source)
 
-## Testing
+## Development
+
+### Quick Start
 
 ```bash
-pytest tests/ -v
+# Install in development mode
+make dev
+
+# Run tests
+make test
+
+# Format code
+make format
+
+# Run linters
+make lint
+```
+
+### Version Management
+
+Update version across all files:
+
+```bash
+make version VERSION=0.6.0
+```
+
+This synchronizes version numbers in:
+- `Cargo.toml`
+- `pyproject.toml`
+- `python/vtt_builder/__init__.py`
+
+### Release Process
+
+```bash
+# 1. Update version
+make version VERSION=0.6.0
+
+# 2. Commit changes
+git add -A
+git commit -m "bump: version 0.6.0"
+
+# 3. Create and push tag
+git tag v0.6.0
+git push && git push origin v0.6.0
+
+# 4. Create GitHub release (triggers automated build and PyPI publish)
+```
+
+### Available Make Commands
+
+```bash
+make help     # Show all available commands
+make dev      # Build and install in development mode
+make build    # Build release wheel
+make test     # Run all tests
+make lint     # Run linters (ruff + clippy)
+make format   # Format code (ruff + cargo fmt)
+make clean    # Remove build artifacts
+```
+
+### Manual Build
+
+```bash
+# Development build
+uv run maturin develop
+
+# Release build
+uv run maturin develop --release
+
+# Build wheel
+uv run maturin build --release
+```
+
+### Testing
+
+```bash
+# All tests
+uv run pytest tests/ -v
+
+# Specific test
+uv run pytest tests/test_vtt_builder.py::TestVTTBuilder::test_build_vtt_from_records -v
 ```
 
 ## License
@@ -584,7 +661,7 @@ MIT
 1. Fork the repository
 2. Create a feature branch
 3. Add tests for new functionality
-4. Ensure all tests pass
+4. Run `make test` and `make lint`
 5. Submit a pull request
 
 ## Version History
