@@ -48,8 +48,16 @@ jobs:
         run: cargo build --release
 
   test-python:
-    name: Python Tests
+    name: Python Tests (${{ matrix.python-version }})
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      # pyproject declares requires-python >= 3.8, but GitHub's hosted runners
+      # no longer ship 3.8, so 3.9 is the lowest rung tested here. 3.8 does
+      # build and pass locally; either lift the floor to 3.9 or accept the gap.
+      # fail-fast is off so a break on a new release does not mask the others.
+      matrix:
+        python-version: ['3.9', '3.10', '3.11', '3.12', '3.13', '3.14']
     steps:
       - uses: actions/checkout@v4  # TODO: Pin to commit SHA (see .github/ACTION_VERSIONS.md)
 
@@ -61,13 +69,16 @@ jobs:
         with:
           enable-cache: true
 
+      - name: Install Python ${{ matrix.python-version }}
+        run: uv python install ${{ matrix.python-version }}
+
       - name: Build extension with maturin
         run: |
-          uv run maturin develop --release
+          uv run --python ${{ matrix.python-version }} maturin develop --release
 
       - name: Run Python tests
         run: |
-          uv run pytest tests/ -v --tb=short
+          uv run --python ${{ matrix.python-version }} pytest tests/ -v --tb=short
 
   lint-python:
     name: Python Linting & Formatting
