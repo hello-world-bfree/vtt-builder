@@ -197,23 +197,107 @@
 
 ## 7. Verify against real consumer data
 
-- [ ] 7.1 **Before wiring section 5 into a release**, run `validate_cue_sequence`
+- [x] 7.1 **Before wiring section 5 into a release**, run `validate_cue_sequence`
       against real records from the transcription Lambda's caption and
       read-along paths. Per design.md, this is how a latent bad sequence gets
       found deliberately instead of by a failed deploy.
-- [ ] 7.2 If any real record set fails, stop and report it — that is a consumer
+      **Run against 9 production VTT files under `$HOME/dev/transcription/`
+      (`data/` and `__data/`), parsed with `parse_vtt_file`. 7 pass, 2 fail.**
+
+      | File | Cues | Span | Result |
+      |---|---|---|---|
+      | `__data/line_miss_ex1.vtt` | 90 | 9.1m | ok |
+      | `__data/line_miss_ex2.vtt` | 157 | 14.0m | ok |
+      | `data/deepgram-year-issue/captions.vtt` | 93 | 10.0m | ok |
+      | `data/deepgram-year-issue/transcript.vtt` | 8 | 10.0m | ok |
+      | `data/test_mov_content/…/failed_transcript.vtt` | 84 | 10.8m | ok |
+      | `data/test_mov_content/…/transcript.vtt` | 87 | 10.8m | ok |
+      | `data/test_re_enrich/output/captions.vtt` | 118 | 9.7m | **overlap** |
+      | `data/test_re_enrich/output/transcript.vtt` | 91 | 9.7m | **overlap** |
+      | `data/transcript.vtt` | 120 | 14.7m | ok |
+- [x] 7.2 If any real record set fails, stop and report it — that is a consumer
       bug this change just surfaced, and it should be triaged before release.
-- [ ] 7.3 Record the outcome in the change before archiving, so the next reader
+      **Reported. The two failures are ONE defect, and it is NOT a live consumer
+      bug — it is a stale artifact. Triage below; it does not block release.**
+
+      Identical fault in both files, one overlapping pair each, read straight
+      from the raw `.vtt` (so not a parser artifact):
+
+      ```
+      00:05:38.500 --> 00:05:50.005     ends   350.005
+      00:05:48.820 --> 00:06:11.810     starts 348.820   overlap 1.185s
+      ```
+
+      Traced upstream:
+
+      ```
+      Deepgram raw paragraphs  -->  0 overlaps
+      Deepgram raw words       -->  3 overlaps   <-- true origin
+        'as'     [169.475->171.795] then 'pride'     start 170.120
+        'humble' [387.705->388.825] then 'listening' start 388.360
+        "that's" [576.820->578.900] then "today's"   start 577.385
+           |
+           v
+      enriched_segments.json   -->  1 overlap (end 350.00509433962264, interpolated)
+           +--> captions.vtt   -->  1 overlap
+           +--> transcript.vtt -->  1 overlap
+      ```
+
+      **Why it does not block:** all four hand-rolled enforcers were read and
+      each one *does* fix this pair. Traced the exact branch for
+      `enforce_min_cue_gap` with the real numbers: `MIN_CUE_GAP=0.1`,
+      `MIN_CAPTION_DURATION=0.75`, `new_end=348.72`,
+      `would_shrink_below_min=False`, `new_end > prev_start=True` → takes the
+      shrink-`prev.end` branch → overlap fixed. `_enforce_monotonic_chunks` is
+      also the last phase of `chunk_for_vtt` (chunker.py PHASE 5) and fixes it
+      too.
+
+      The artifacts are simply older than the guards:
+
+      ```
+      captions.vtt / transcript.vtt   2026-01-14
+      enriched_segments.json          2026-01-17
+      chunker.py                      2026-08-30   <-- guards are ~7 months newer
+      vtt_utils.py                    2026-08-30
+      ```
+
+      So the corpus caught a **genuine historical defect** that current code
+      already prevents. That is the validator doing its job, and it is also
+      why design.md's "its records are probably clean" was right about the
+      live path and wrong to be confident.
+
+      **Still worth filing in the consumer** (not this repo): Deepgram emits
+      non-monotonic *word* timings, and nothing asserts on them at ingest —
+      `extract_word_timings` feeds them straight into alignment. The guards
+      repair the symptom downstream; nothing reports the cause. A
+      `validate_cue_sequence` assertion at the word-timing boundary would.
+- [x] 7.3 Record the outcome in the change before archiving, so the next reader
       knows whether real data was ever exercised.
-- [ ] 7.4 **Define what "real records" concretely means before starting 7.1**, or
-      this task gets checked off on nothing. Nothing in this repo can reach the
-      transcription Lambda, so name one: a fixture of exported records committed
-      under `tests/fixtures/`, or a scratch script run in the consumer repo whose
-      output is pasted into 7.3. Pick one and say which — an unfalsifiable task
-      is worse than an open one.
+      **Done — 7.1 and 7.2 above are that record.** Real data was exercised: 9
+      files, 848 cues total. One historical defect found, root-caused to
+      Deepgram word timings, confirmed already-fixed in current consumer code.
+- [x] 7.4 **Define what "real records" concretely means before starting 7.1**, or
+      this task gets checked off on nothing.
+      **Chosen: a scratch script run against the consumer repo's own
+      `data/`/`__data/` VTT corpus, with results pasted into 7.1/7.2 above.**
+      No fixture was committed to this repo — the corpus is 9 real files
+      totalling ~1.4MB of customer transcript text, which does not belong in an
+      open-source library's test fixtures. Reproduce with the script in the
+      session scratchpad (`validate_real_records.py`), or re-derive it: glob
+      `**/*.vtt` under the consumer's `data/` and `__data/`, `parse_vtt_file`
+      each, then `validate_cue_sequence`.
 - [ ] 7.5 Include at least one record set from a long-duration item (an hour or
       more) in whatever 7.4 selects. Sub-millisecond drift is magnitude-dependent,
       so a short clip cannot exercise the quantization behavior that 2.2 chose.
+      **NOT SATISFIED.** Longest item in the available corpus is **14.7 minutes**
+      (881.6s); the whole corpus spans 8–15 minutes. Nothing here exercises
+      timestamps where f64 spacing has grown enough to matter, which is the
+      entire premise of the millisecond-quantization decision in 2.2. The
+      synthetic cover in `TestCueSequenceQuantization::
+      test_long_duration_timestamps_compare_correctly` uses 7200s (2h) and
+      passes, but synthetic is not the same as a real hour-long episode with
+      real accumulated interpolation error. Left open deliberately: find a
+      long-form episode before treating §7 as fully discharged.
 
 ## 8. Release
 

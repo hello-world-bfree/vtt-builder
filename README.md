@@ -6,7 +6,8 @@ High-performance WebVTT file generation with spec compliance, powered by Rust.
 
 - **Spec Compliant**: Automatic character escaping (`&`, `<`, `>`) per WebVTT specification
 - **Fast**: Rust core with PyO3 bindings for optimal performance
-- **Safe**: Input validation prevents malformed output
+- **Safe**: Input validation prevents malformed output — both per-cue and across
+  the cue sequence (ordering, overlap, gaps, media-duration bounds)
 - **Multilingual**: Full Unicode support for Spanish, Portuguese, French, German, Italian, Polish, and more
 - **Flexible**: Build from JSON files or Python dictionaries
 - **Robust**: Comprehensive error handling with specific exception types
@@ -101,6 +102,7 @@ from vtt_builder import (
     VttTimestampError,  # Timestamp issues
     VttHeaderError,     # Header format errors
     VttCueError,        # Cue content errors
+    VttSequenceError,   # Cross-cue ordering, overlap, gap, duration issues
 )
 
 try:
@@ -112,6 +114,21 @@ except VttValidationError:
     # Handle any validation error
     pass
 ```
+
+The hierarchy lets you separate a fault in one cue from a fault in how the cues
+relate to each other, without matching on message text:
+
+```
+VttError
+└── VttValidationError
+    ├── VttTimestampError    single cue: negative / oversized timestamps
+    ├── VttHeaderError       file header
+    ├── VttCueError          single cue: empty text, forbidden "-->"
+    ├── VttEscapingError     escaping
+    └── VttSequenceError     the cue LIST: order, overlap, gap, duration
+```
+
+Catching `VttValidationError` still catches all of them.
 
 ## Data Formats
 
@@ -156,7 +173,18 @@ build_vtt_from_records(segments, "output.vtt")
 - `segments_list` (list[dict]): List of segment dictionaries
 - `output_file` (str): Output file path
 - `escape_text` (bool): Escape special characters (default: True)
-- `validate_segments` (bool): Validate input data (default: True)
+- `validate_segments` (bool): Validate input data (default: True). Applies both
+  per-cue checks and sequence checks; set to `False` to skip both.
+
+With validation enabled, the cue list is checked **as a sequence** as well as
+per-cue, so an out-of-order or overlapping list raises `VttSequenceError` instead
+of producing a malformed file. Validation completes before the destination is
+touched, and content is written to a temporary sibling file and renamed into
+place — so a rejected or failed build leaves no partial file behind, and an
+existing file at the destination is left intact.
+
+Because the write goes through a temporary sibling file, the destination
+**directory** must be writable, not just the destination path.
 
 ---
 
@@ -170,6 +198,15 @@ build_vtt_from_json_files(
     "combined.vtt"
 )
 ```
+
+> **Validation scope.** This builder validates each cue on its own but does
+> **not** check cue ordering or overlap — not even within a single file. It reads
+> the input files one at a time and writes each before reading the next, so it
+> never holds the whole cue list and cannot see across a file boundary. A check
+> covering only within-file ordering would imply a guarantee it cannot make.
+>
+> If you need the sequence guarantee, read the records yourself, concatenate
+> them, and call `build_vtt_from_records`.
 
 ---
 
@@ -211,7 +248,9 @@ except Exception as e:
 
 ### `validate_segments(segments_list)`
 
-Pre-validate segment data before building.
+Pre-validate segment data before building. Checks each cue **on its own** —
+negative or oversized timestamps, `end < start`, empty text. It does not compare
+a cue against its neighbours; use `validate_cue_sequence` for that.
 
 ```python
 from vtt_builder import validate_segments
@@ -219,6 +258,96 @@ from vtt_builder import validate_segments
 segments = load_from_database()
 validate_segments(segments)  # Raises if invalid
 build_vtt_from_records(segments, "output.vtt", validate_segments=False)
+```
+
+---
+
+### `validate_cue_sequence(segments_list, min_gap=None, audio_duration=None)`
+
+Validate a cue list **as an ordered sequence**. Catches the failure per-cue
+validation cannot see: cues that are each individually valid but collectively
+out of order, overlapping, or past the end of the media.
+
+```python
+from vtt_builder import validate_cue_sequence, VttSequenceError
+
+segments = [
+    {"start": 0.0, "end": 5.0, "text": "Hello"},
+    {"start": 3.0, "end": 7.0, "text": "World"},  # starts before previous ends
+]
+
+try:
+    validate_cue_sequence(segments)
+except VttSequenceError as e:
+    print(e)
+    # Segment 2 (index 1): cue overlaps the previous cue (segment 1, index 0);
+    # cue starts at 3 but previous cue ends at 5 (overlap 2)
+```
+
+**Arguments**
+
+- `segments_list` (list): Segment dictionaries
+- `min_gap` (float, optional): Require at least this many seconds between
+  adjacent cues. Omit to allow cues to abut exactly.
+- `audio_duration` (float, optional): Reject cues that start at or after this,
+  or end after it.
+
+**What it rejects**
+
+| Condition | Example |
+|---|---|
+| Out of chronological order | cue starts before its predecessor starts |
+| Overlap | cue starts before its predecessor ends |
+| Zero-length cue | `start == end` (never displayed by a player) |
+| Gap below `min_gap` | only when `min_gap` is given |
+| Past `audio_duration` | only when `audio_duration` is given |
+
+Exact abutment (`previous end == next start`) is **valid** — it is the normal
+output of a well-behaved chunker. Pass `min_gap` if you need separation.
+
+Comparisons are made at millisecond precision, matching what WebVTT actually
+serializes, so two times that write identically compare as equal regardless of
+the floating-point arithmetic that produced them. A sub-millisecond overlap is
+not reported, because it cannot appear in the output file.
+
+Returns `True` on success; raises `VttSequenceError` otherwise. Empty and
+single-cue lists always pass — no cue pair exists to conflict.
+
+---
+
+### `clamp_to_duration(segments_list, audio_duration)`
+
+Bound every cue to lie within a media duration, so you can *correct* out-of-range
+cues rather than only detect them.
+
+```python
+from vtt_builder import clamp_to_duration
+
+segments = [
+    {"start": 0.0, "end": 2.5, "text": "Kept as-is"},
+    {"start": 2.5, "end": 9.0, "text": "End truncated to 5.0"},
+    {"start": 12.0, "end": 14.0, "text": "Dropped entirely"},
+]
+
+clamped = clamp_to_duration(segments, 5.0)
+# [{"id": 1, "start": 0.0, "end": 2.5, ...},
+#  {"id": 2, "start": 2.5, "end": 5.0, ...}]
+```
+
+- A cue ending after `audio_duration` has its end truncated; its start is unchanged
+- A cue starting at or after `audio_duration` is omitted
+- Cues already in range are returned unchanged
+- IDs are renumbered sequentially from 1
+
+Like the other transformations, the returned dictionaries carry exactly `id`,
+`start`, `end`, and `text` — extra keys such as `speaker` or `confidence` are not
+preserved.
+
+Pairs naturally with `validate_cue_sequence`: clamp first, then assert.
+
+```python
+clamped = clamp_to_duration(segments, audio_duration)
+validate_cue_sequence(clamped, audio_duration=audio_duration)
 ```
 
 ---
