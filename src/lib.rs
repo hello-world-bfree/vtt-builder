@@ -12,6 +12,7 @@ create_exception!(vtt_builder, VttTimestampError, VttValidationError);
 create_exception!(vtt_builder, VttHeaderError, VttValidationError);
 create_exception!(vtt_builder, VttCueError, VttValidationError);
 create_exception!(vtt_builder, VttEscapingError, VttValidationError);
+create_exception!(vtt_builder, VttSequenceError, VttValidationError);
 
 // Maximum allowed timestamp in seconds (99:59:59.999)
 const MAX_TIMESTAMP_SECONDS: f64 = 359999.999;
@@ -71,6 +72,25 @@ fn header_error(msg: &str) -> PyErr {
 
 fn cue_error(msg: &str) -> PyErr {
     VttCueError::new_err(msg.to_string())
+}
+
+fn sequence_error(msg: &str) -> PyErr {
+    VttSequenceError::new_err(msg.to_string())
+}
+
+/// Quantizes a time in seconds to whole milliseconds.
+///
+/// Cue times are compared at millisecond precision because that is the precision
+/// the WebVTT format serializes: a difference finer than one millisecond cannot
+/// appear in the output file and cannot affect a player. Comparing raw f64 would
+/// make exact abutment (`prev.end == next.start`) depend on the arithmetic that
+/// produced each value, since floating-point absolute error scales with
+/// magnitude.
+///
+/// Uses the same rounding as `format_timestamp_flexible`, so a value that writes
+/// as `00:00:01.500` quantizes to `1500`.
+fn to_millis(seconds: f64) -> u64 {
+    (seconds * 1000.0).round() as u64
 }
 
 /// Helper function to extract segment data from a PyDict.
@@ -199,6 +219,121 @@ fn validate_segment(segment: &Segment) -> PyResult<()> {
     Ok(())
 }
 
+/// Validates a cue list as an ordered sequence.
+///
+/// Operates on an already-extracted slice so both the public `validate_cue_sequence`
+/// and the builders can call it without re-extracting dictionaries.
+///
+/// All comparisons are made on times quantized to whole milliseconds (see
+/// `to_millis`). Error messages report the original unquantized times, so a
+/// reader matching a log line against input data sees the values they passed in.
+///
+/// Checks, in order, for each adjacent pair:
+/// - Zero-length cues (start == end after quantization)
+/// - Out-of-order starts (start < previous start)
+/// - Overlap (start < previous end); exact abutment is valid
+/// - Minimum gap, when requested
+/// - Media duration bounds, when requested
+fn check_cue_sequence(
+    segments: &[Segment],
+    min_gap: Option<f64>,
+    audio_duration: Option<f64>,
+) -> PyResult<()> {
+    let duration_bound = audio_duration.map(|d| (to_millis(d), d));
+    let gap_bound = min_gap.map(|g| (to_millis(g), g));
+
+    for (idx, segment) in segments.iter().enumerate() {
+        let start_ms = to_millis(segment.start);
+        let end_ms = to_millis(segment.end);
+
+        if start_ms == end_ms {
+            return Err(sequence_error(&format!(
+                "Segment {} (index {}): cue has zero duration at millisecond \
+                 precision (start {}, end {}); a zero-length cue is never displayed",
+                segment.id, idx, segment.start, segment.end
+            )));
+        }
+
+        if let Some((duration_ms, audio_duration)) = duration_bound {
+            if start_ms >= duration_ms {
+                return Err(sequence_error(&format!(
+                    "Segment {} (index {}): cue starts at or after the media duration \
+                     (start {}, duration {})",
+                    segment.id, idx, segment.start, audio_duration
+                )));
+            }
+
+            if end_ms > duration_ms {
+                return Err(sequence_error(&format!(
+                    "Segment {} (index {}): cue ends after the media duration \
+                     (end {}, duration {}, overrun {})",
+                    segment.id,
+                    idx,
+                    segment.end,
+                    audio_duration,
+                    segment.end - audio_duration
+                )));
+            }
+        }
+
+        if idx == 0 {
+            continue;
+        }
+
+        let prev = &segments[idx - 1];
+        let prev_start_ms = to_millis(prev.start);
+        let prev_end_ms = to_millis(prev.end);
+
+        if start_ms < prev_start_ms {
+            return Err(sequence_error(&format!(
+                "Segment {} (index {}): cue starts before the previous cue \
+                 (segment {}, index {}) starts; cues are out of chronological order \
+                 (start {}, previous start {})",
+                segment.id,
+                idx,
+                prev.id,
+                idx - 1,
+                segment.start,
+                prev.start
+            )));
+        }
+
+        if start_ms < prev_end_ms {
+            return Err(sequence_error(&format!(
+                "Segment {} (index {}): cue overlaps the previous cue \
+                 (segment {}, index {}); cue starts at {} but previous cue ends at {} \
+                 (overlap {})",
+                segment.id,
+                idx,
+                prev.id,
+                idx - 1,
+                segment.start,
+                prev.end,
+                prev.end - segment.start
+            )));
+        }
+
+        if let Some((min_gap_ms, min_gap)) = gap_bound {
+            let gap_ms = start_ms - prev_end_ms;
+            if gap_ms < min_gap_ms {
+                return Err(sequence_error(&format!(
+                    "Segment {} (index {}): gap from the previous cue \
+                     (segment {}, index {}) is {} seconds, less than the required \
+                     minimum of {} seconds",
+                    segment.id,
+                    idx,
+                    prev.id,
+                    idx - 1,
+                    segment.start - prev.end,
+                    min_gap
+                )));
+            }
+        }
+    }
+
+    Ok(())
+}
+
 /// Formats a timestamp with optional short format (MM:SS.mmm when hours = 0).
 ///
 /// The WebVTT spec allows timestamps without hours component when the time
@@ -310,6 +445,18 @@ fn write_segments_to_vtt<W: Write>(
 /// This function reads transcript data from JSON files and generates a
 /// spec-compliant WebVTT file with proper character escaping.
 ///
+/// # Validation scope
+/// This builder validates each cue on its own. It does **not** check cue
+/// ordering, overlap, or gaps — not even within a single file. It reads the
+/// input files one at a time and writes each before reading the next, advancing
+/// a running time offset, so it never holds the whole cue list and cannot see
+/// across a file boundary. A check that covered only within-file ordering would
+/// imply a guarantee it cannot make, which is worse than no check: cross-file
+/// boundaries are exactly where a bad offset shows up.
+///
+/// If you need the sequence guarantee, read the records yourself, concatenate
+/// them, and call `build_vtt_from_records`, which validates the full sequence.
+///
 /// # Arguments
 /// * `file_paths` - List of paths to JSON files containing transcript data
 /// * `output_file` - Path where the VTT file will be written
@@ -392,16 +539,82 @@ fn build_transcript_from_json_files(file_paths: Vec<String>, output_file: &str) 
     Ok(())
 }
 
+/// Builds a sibling temporary path for an output file.
+///
+/// The temporary file lives in the same directory as the destination so the
+/// final rename is same-filesystem and therefore atomic.
+fn temp_path_for(output_file: &str) -> std::path::PathBuf {
+    let path = std::path::Path::new(output_file);
+    let file_name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "output.vtt".to_string());
+
+    let unique = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+
+    let temp_name = format!(".{}.{}.{}.tmp", file_name, std::process::id(), unique);
+
+    match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(temp_name),
+        _ => std::path::PathBuf::from(temp_name),
+    }
+}
+
+/// Writes VTT content to a temporary sibling file and renames it into place.
+///
+/// Nothing appears at `output_file` until the content is complete, so a failed
+/// build cannot leave a partial file where a caller would read it as a success,
+/// and an existing file at the destination survives a failure untouched.
+fn write_vtt_atomically(
+    segments: &[Segment],
+    output_file: &str,
+    config: &VttConfig,
+) -> PyResult<()> {
+    let temp_path = temp_path_for(output_file);
+
+    let write_result = (|| -> Result<(), std::io::Error> {
+        let mut output = File::create(&temp_path)?;
+        write_vtt_header(&mut output, config)?;
+        write_segments_to_vtt(segments, 0.0, 1, &mut output, config)?;
+        output.flush()?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(map_io_error(e));
+    }
+
+    if let Err(e) = std::fs::rename(&temp_path, output_file) {
+        let _ = std::fs::remove_file(&temp_path);
+        return Err(map_io_error(e));
+    }
+
+    Ok(())
+}
+
 /// Builds a VTT file from a list of Python dictionaries representing segments.
 ///
 /// This is the most flexible way to create VTT files from Python, allowing
 /// direct control over segment data.
 ///
+/// When validation is enabled, every cue is validated on its own *and* the list
+/// is validated as a sequence (ordering, overlap, zero-length cues), so a list
+/// whose cues are individually valid but collectively malformed raises rather
+/// than being written out. Validation completes before the destination is
+/// touched, and content is written to a temporary sibling file and renamed into
+/// place, so a rejected or failed build leaves no partial file behind and does
+/// not disturb an existing file at the destination.
+///
 /// # Arguments
 /// * `segments_list` - List of dictionaries with keys: id, start, end, text
 /// * `output_file` - Path where the VTT file will be written
 /// * `escape_text` - Whether to escape special characters (default: true)
-/// * `validate_segments` - Whether to validate segment data (default: true)
+/// * `validate_segments` - Whether to validate segment data (default: true).
+///   Setting this to false skips both the per-cue and the sequence checks.
 ///
 /// # Example
 /// ```python
@@ -424,33 +637,18 @@ fn build_vtt_from_records(
         ..Default::default()
     };
 
-    let mut output = File::create(output_file).map_err(map_io_error)?;
-    write_vtt_header(&mut output, &config).map_err(map_io_error)?;
+    // Extract and validate everything before touching the destination, so a
+    // rejected build cannot leave a truncated file behind.
+    let segments = extract_segments(segments_list)?;
 
-    let mut segments = Vec::new();
-
-    for (idx, segment) in segments_list.iter().enumerate() {
-        let segment_dict = segment.downcast::<PyDict>()?;
-        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
-
-        let segment = Segment {
-            id,
-            start,
-            end,
-            text: text.trim().to_string(),
-        };
-
-        // Validate if requested
-        if validate_segments {
-            validate_segment(&segment)?;
+    if validate_segments {
+        for segment in &segments {
+            validate_segment(segment)?;
         }
-
-        segments.push(segment);
+        check_cue_sequence(&segments, None, None)?;
     }
 
-    write_segments_to_vtt(&segments, 0.0, 1, &mut output, &config).map_err(map_io_error)?;
-
-    Ok(())
+    write_vtt_atomically(&segments, output_file, &config)
 }
 
 /// Validates a WebVTT file for spec compliance.
@@ -567,6 +765,234 @@ fn validate_vtt_file(vtt_file: &str) -> PyResult<bool> {
     }
 
     Ok(true)
+}
+
+fn parse_timestamp_to_seconds(timestamp: &str) -> Result<f64, String> {
+    let parts: Vec<&str> = timestamp.split('.').collect();
+    if parts.len() != 2 {
+        return Err(format!(
+            "Invalid timestamp format (missing milliseconds): '{}'",
+            timestamp
+        ));
+    }
+
+    let time_part = parts[0];
+    let millis_str = parts[1];
+
+    if millis_str.len() != 3 || !millis_str.chars().all(|c| c.is_ascii_digit()) {
+        return Err(format!(
+            "Milliseconds must be exactly 3 digits: '{}'",
+            millis_str
+        ));
+    }
+
+    let millis: f64 = millis_str
+        .parse::<u32>()
+        .map_err(|_| format!("Invalid milliseconds value: '{}'", millis_str))?
+        as f64
+        / 1000.0;
+
+    let time_parts: Vec<&str> = time_part.split(':').collect();
+
+    match time_parts.len() {
+        2 => {
+            let minutes: f64 = time_parts[0]
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid minutes value: '{}'", time_parts[0]))?
+                as f64;
+            let secs: f64 = time_parts[1]
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid seconds value: '{}'", time_parts[1]))?
+                as f64;
+            if secs >= 60.0 {
+                return Err(format!("Seconds must be 0-59: '{}'", time_parts[1]));
+            }
+            Ok(minutes * 60.0 + secs + millis)
+        }
+        3 => {
+            let hours: f64 = time_parts[0]
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid hours value: '{}'", time_parts[0]))?
+                as f64;
+            let minutes: f64 = time_parts[1]
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid minutes value: '{}'", time_parts[1]))?
+                as f64;
+            let secs: f64 = time_parts[2]
+                .parse::<u32>()
+                .map_err(|_| format!("Invalid seconds value: '{}'", time_parts[2]))?
+                as f64;
+            if minutes >= 60.0 {
+                return Err(format!("Minutes must be 0-59: '{}'", time_parts[1]));
+            }
+            if secs >= 60.0 {
+                return Err(format!("Seconds must be 0-59: '{}'", time_parts[2]));
+            }
+            Ok(hours * 3600.0 + minutes * 60.0 + secs + millis)
+        }
+        _ => Err(format!("Invalid timestamp format: '{}'", timestamp)),
+    }
+}
+
+fn parse_timing_line(line: &str) -> Result<(f64, f64), String> {
+    let parts: Vec<&str> = line.split("-->").collect();
+    if parts.len() != 2 {
+        return Err(format!("Invalid timing line: '{}'", line));
+    }
+
+    let start_str = parts[0].trim();
+    let end_part = parts[1].trim();
+    let end_str = end_part.split_whitespace().next().unwrap_or("");
+
+    let start = parse_timestamp_to_seconds(start_str)?;
+    let end = parse_timestamp_to_seconds(end_str)?;
+    Ok((start, end))
+}
+
+fn parse_vtt_lines(
+    lines: &mut impl Iterator<Item = Result<String, std::io::Error>>,
+) -> PyResult<Vec<(f64, f64, String)>> {
+    let header = lines
+        .next()
+        .ok_or_else(|| header_error("Empty file"))?
+        .map_err(map_io_error)?;
+
+    let header = header.trim_start_matches('\u{FEFF}');
+    let header_trimmed = header.trim();
+
+    if !(header_trimmed == "WEBVTT"
+        || header_trimmed.starts_with("WEBVTT ")
+        || header_trimmed.starts_with("WEBVTT\t"))
+    {
+        return Err(header_error(&format!(
+            "Invalid WEBVTT header. Got: '{}'",
+            header_trimmed
+        )));
+    }
+
+    for line_result in &mut *lines {
+        let content = line_result.map_err(map_io_error)?;
+        if content.trim().is_empty() {
+            break;
+        }
+    }
+
+    let mut segments: Vec<(f64, f64, String)> = Vec::new();
+
+    while let Some(line_result) = lines.next() {
+        let line = line_result.map_err(map_io_error)?;
+        let line_trimmed = line.trim();
+
+        if line_trimmed.is_empty() {
+            continue;
+        }
+
+        if line_trimmed.starts_with("NOTE")
+            || line_trimmed.starts_with("STYLE")
+            || line_trimmed.starts_with("REGION")
+        {
+            for block_line_result in &mut *lines {
+                let block_content = block_line_result.map_err(map_io_error)?;
+                if block_content.trim().is_empty() {
+                    break;
+                }
+            }
+            continue;
+        }
+
+        let timing_line = if !line_trimmed.contains("-->") {
+            let next = lines
+                .next()
+                .ok_or_else(|| {
+                    cue_error(&format!(
+                        "Expected timing line after cue identifier '{}'",
+                        line_trimmed
+                    ))
+                })?
+                .map_err(map_io_error)?;
+            next.trim().to_string()
+        } else {
+            line_trimmed.to_string()
+        };
+
+        let (start, end) = parse_timing_line(&timing_line).map_err(|e| timestamp_error(&e))?;
+
+        let mut text_lines: Vec<String> = Vec::new();
+        for cue_result in &mut *lines {
+            let content = cue_result.map_err(map_io_error)?;
+            if content.trim().is_empty() {
+                break;
+            }
+            text_lines.push(content.trim().to_string());
+        }
+
+        if text_lines.is_empty() {
+            return Err(cue_error("Cue missing text content"));
+        }
+
+        let text = text_lines.join("\n");
+        segments.push((start, end, text));
+    }
+
+    Ok(segments)
+}
+
+/// Parses a WebVTT file and returns a list of segment dictionaries.
+///
+/// Each segment dict has keys: id (int), start (float), end (float), text (str).
+/// Text is unescaped by default (e.g., &amp; becomes &).
+///
+/// # Arguments
+/// * `vtt_file` - Path to the VTT file to parse
+/// * `unescape` - Whether to unescape VTT entities in text (default: true)
+#[pyfunction]
+#[pyo3(signature = (vtt_file, unescape=true))]
+fn parse_vtt_file(py: Python<'_>, vtt_file: &str, unescape: bool) -> PyResult<Py<PyList>> {
+    let file = File::open(vtt_file).map_err(map_io_error)?;
+    let reader = BufReader::new(file);
+    let mut lines = reader.lines();
+
+    let segments = parse_vtt_lines(&mut lines)?;
+    segments_to_pylist(py, &segments, unescape)
+}
+
+/// Parses a WebVTT string and returns a list of segment dictionaries.
+///
+/// Each segment dict has keys: id (int), start (float), end (float), text (str).
+/// Text is unescaped by default (e.g., &amp; becomes &).
+///
+/// # Arguments
+/// * `vtt_content` - WebVTT content as a string
+/// * `unescape` - Whether to unescape VTT entities in text (default: true)
+#[pyfunction]
+#[pyo3(signature = (vtt_content, unescape=true))]
+fn parse_vtt_string(py: Python<'_>, vtt_content: &str, unescape: bool) -> PyResult<Py<PyList>> {
+    let mut lines = vtt_content.lines().map(|l| Ok(l.to_string()));
+
+    let segments = parse_vtt_lines(&mut lines)?;
+    segments_to_pylist(py, &segments, unescape)
+}
+
+fn segments_to_pylist(
+    py: Python<'_>,
+    segments: &[(f64, f64, String)],
+    unescape: bool,
+) -> PyResult<Py<PyList>> {
+    let result = PyList::empty(py);
+    for (idx, (start, end, text)) in segments.iter().enumerate() {
+        let dict = PyDict::new(py);
+        dict.set_item("id", idx + 1)?;
+        dict.set_item("start", start)?;
+        dict.set_item("end", end)?;
+        let final_text = if unescape {
+            unescape_vtt_text(text)
+        } else {
+            text.clone()
+        };
+        dict.set_item("text", final_text)?;
+        result.append(dict)?;
+    }
+    Ok(result.into())
 }
 
 /// Validates a WebVTT timing line (e.g., "00:00:00.000 --> 00:00:05.000").
@@ -717,6 +1143,12 @@ fn escape_vtt_text_py(text: &str) -> String {
 ///
 /// This is useful for pre-validating data before attempting to build a VTT file.
 ///
+/// Checks each segment on its own. It does **not** check a segment against its
+/// neighbours, so an ordered-and-overlapping list passes here; use
+/// `validate_cue_sequence` for ordering, overlap, gaps, and media-duration
+/// bounds. In particular a zero-length cue (`start == end`) is accepted here and
+/// rejected by `validate_cue_sequence`.
+///
 /// # Arguments
 /// * `segments_list` - List of dictionaries with keys: id, start, end, text
 ///
@@ -742,6 +1174,139 @@ fn validate_segments(segments_list: &Bound<'_, PyList>) -> PyResult<bool> {
     Ok(true)
 }
 
+/// Extracts a whole Python segment list into a `Vec<Segment>`.
+///
+/// Shared by the functions that need the complete list before doing any work,
+/// so cross-cue checks have something to look at.
+fn extract_segments(segments_list: &Bound<'_, PyList>) -> PyResult<Vec<Segment>> {
+    let mut segments = Vec::with_capacity(segments_list.len());
+
+    for (idx, segment) in segments_list.iter().enumerate() {
+        let segment_dict = segment.downcast::<PyDict>()?;
+        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
+
+        segments.push(Segment {
+            id,
+            start,
+            end,
+            text: text.trim().to_string(),
+        });
+    }
+
+    Ok(segments)
+}
+
+/// Validates a cue list as an ordered sequence.
+///
+/// Where `validate_segments` checks each cue on its own, this checks each cue
+/// against its neighbours: ordering, overlap, an optional minimum gap, optional
+/// media-duration bounds, and zero-length cues.
+///
+/// Comparisons are made at millisecond precision — the precision the WebVTT
+/// format serializes — so two times that write identically compare as equal
+/// regardless of the arithmetic that produced them. Exact abutment
+/// (`previous end == next start`) is valid, since it is the normal output of a
+/// well-behaved chunker; pass `min_gap` to require separation.
+///
+/// # Arguments
+/// * `segments_list` - List of dictionaries with keys: id, start, end, text
+/// * `min_gap` - Optional minimum gap in seconds required between adjacent cues
+/// * `audio_duration` - Optional media duration in seconds bounding every cue
+///
+/// # Returns
+/// * `Ok(true)` if the sequence is valid
+/// * `Err(VttSequenceError)` naming both cues and the conflicting times
+///
+/// # Example
+/// ```python
+/// from vtt_builder import validate_cue_sequence
+///
+/// segments = [
+///     {"start": 0.0, "end": 2.5, "text": "Hello"},
+///     {"start": 2.5, "end": 5.0, "text": "World"},
+/// ]
+/// validate_cue_sequence(segments)  # True; exact abutment is valid
+/// validate_cue_sequence(segments, min_gap=0.1)  # raises VttSequenceError
+/// validate_cue_sequence(segments, audio_duration=4.0)  # raises VttSequenceError
+/// ```
+#[pyfunction]
+#[pyo3(signature = (segments_list, min_gap=None, audio_duration=None))]
+fn validate_cue_sequence(
+    segments_list: &Bound<'_, PyList>,
+    min_gap: Option<f64>,
+    audio_duration: Option<f64>,
+) -> PyResult<bool> {
+    let segments = extract_segments(segments_list)?;
+    check_cue_sequence(&segments, min_gap, audio_duration)?;
+    Ok(true)
+}
+
+/// Bounds every cue in a list to lie within a media duration.
+///
+/// Lets a caller correct out-of-range cues rather than only detect them:
+/// - A cue ending after `audio_duration` has its end truncated to it
+/// - A cue starting at or after `audio_duration` is omitted
+/// - Cues already within the duration are returned unchanged
+///
+/// Like the other transformations, the returned dictionaries carry exactly
+/// `id`, `start`, `end`, and `text`; extra keys such as `speaker` or
+/// `confidence` are not preserved. IDs are renumbered sequentially from 1.
+///
+/// # Arguments
+/// * `segments_list` - List of segment dictionaries
+/// * `audio_duration` - Media duration in seconds
+///
+/// # Returns
+/// * List of segment dictionaries bounded to the duration
+///
+/// # Example
+/// ```python
+/// from vtt_builder import clamp_to_duration
+///
+/// segments = [
+///     {"start": 0.0, "end": 2.5, "text": "Kept"},
+///     {"start": 2.5, "end": 9.0, "text": "Truncated"},
+///     {"start": 12.0, "end": 14.0, "text": "Dropped"},
+/// ]
+/// clamp_to_duration(segments, 5.0)
+/// # [{"id": 1, "start": 0.0, "end": 2.5, ...},
+/// #  {"id": 2, "start": 2.5, "end": 5.0, ...}]
+/// ```
+#[pyfunction]
+fn clamp_to_duration(
+    py: Python<'_>,
+    segments_list: &Bound<'_, PyList>,
+    audio_duration: f64,
+) -> PyResult<Py<PyList>> {
+    let segments = extract_segments(segments_list)?;
+
+    let result = PyList::empty(py);
+    let mut next_id = 1u32;
+
+    for segment in &segments {
+        if segment.start >= audio_duration {
+            continue;
+        }
+
+        let end = if segment.end > audio_duration {
+            audio_duration
+        } else {
+            segment.end
+        };
+
+        let dict = PyDict::new(py);
+        dict.set_item("id", next_id)?;
+        dict.set_item("start", segment.start)?;
+        dict.set_item("end", end)?;
+        dict.set_item("text", &segment.text)?;
+        result.append(dict)?;
+
+        next_id += 1;
+    }
+
+    Ok(result.into())
+}
+
 /// Builds a VTT string from a list of Python dictionaries (in-memory, no file I/O).
 ///
 /// This is useful for:
@@ -749,13 +1314,22 @@ fn validate_segments(segments_list: &Bound<'_, PyList>) -> PyResult<bool> {
 /// - Testing and debugging
 /// - Streaming or API responses
 ///
+/// When validation is enabled, every cue is validated on its own *and* the list
+/// is validated as a sequence (ordering, overlap, zero-length cues), so a list
+/// whose cues are individually valid but collectively malformed raises rather
+/// than being returned as content.
+///
 /// # Arguments
 /// * `segments_list` - List of dictionaries with keys: id, start, end, text
 /// * `escape_text` - Whether to escape special characters (default: true)
-/// * `validate` - Whether to validate segment data (default: true)
+/// * `validate` - Whether to validate segment data (default: true). Setting this
+///   to false skips both the per-cue and the sequence checks. Note this builder
+///   names the flag `validate`, while the file builders name theirs
+///   `validate_segments`.
 ///
 /// # Returns
 /// * String containing the complete VTT file content
+/// * `Err(VttSequenceError)` if the cues are collectively malformed
 #[pyfunction]
 #[pyo3(signature = (segments_list, escape_text=true, validate=true))]
 fn build_vtt_string(
@@ -768,29 +1342,20 @@ fn build_vtt_string(
         ..Default::default()
     };
 
+    // Validate everything before producing any content, so a rejected build
+    // returns an error rather than a partially built string.
+    let segments = extract_segments(segments_list)?;
+
+    if validate {
+        for segment in &segments {
+            validate_segment(segment)?;
+        }
+        check_cue_sequence(&segments, None, None)?;
+    }
+
     let mut output = Vec::new();
     write_vtt_header(&mut output, &config)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
-
-    let mut segments = Vec::new();
-
-    for (idx, segment) in segments_list.iter().enumerate() {
-        let segment_dict = segment.downcast::<PyDict>()?;
-        let (id, start, end, text) = extract_segment_data(segment_dict, idx)?;
-
-        let segment = Segment {
-            id,
-            start,
-            end,
-            text: text.trim().to_string(),
-        };
-
-        if validate {
-            validate_segment(&segment)?;
-        }
-
-        segments.push(segment);
-    }
 
     write_segments_to_vtt(&segments, 0.0, 1, &mut output, &config)
         .map_err(|e| pyo3::exceptions::PyRuntimeError::new_err(e.to_string()))?;
@@ -1893,6 +2458,7 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add("VttHeaderError", m.py().get_type::<VttHeaderError>())?;
     m.add("VttCueError", m.py().get_type::<VttCueError>())?;
     m.add("VttEscapingError", m.py().get_type::<VttEscapingError>())?;
+    m.add("VttSequenceError", m.py().get_type::<VttSequenceError>())?;
 
     // Add main builder functions
     m.add_function(wrap_pyfunction!(build_transcript_from_json_files, m)?)?;
@@ -1903,6 +2469,11 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
     // Add validation functions
     m.add_function(wrap_pyfunction!(validate_vtt_file, m)?)?;
     m.add_function(wrap_pyfunction!(validate_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(validate_cue_sequence, m)?)?;
+
+    // Add parser functions
+    m.add_function(wrap_pyfunction!(parse_vtt_file, m)?)?;
+    m.add_function(wrap_pyfunction!(parse_vtt_string, m)?)?;
 
     // Add utility functions
     m.add_function(wrap_pyfunction!(escape_vtt_text_py, m)?)?;
@@ -1910,6 +2481,7 @@ fn _lowlevel(m: &Bound<'_, PyModule>) -> PyResult<()> {
 
     // Add transformation functions
     m.add_function(wrap_pyfunction!(merge_segments, m)?)?;
+    m.add_function(wrap_pyfunction!(clamp_to_duration, m)?)?;
     m.add_function(wrap_pyfunction!(split_long_segments, m)?)?;
     m.add_function(wrap_pyfunction!(shift_timestamps, m)?)?;
     m.add_function(wrap_pyfunction!(filter_segments_by_time, m)?)?;
@@ -2144,5 +2716,144 @@ mod tests {
         assert_eq!(format_timestamp_internal(90.0), "01:30");
         assert_eq!(format_timestamp_internal(3661.0), "01:01:01");
         assert_eq!(format_timestamp_internal(59.0), "00:59");
+    }
+
+    fn seg(id: u32, start: f64, end: f64) -> Segment {
+        Segment {
+            id,
+            start,
+            end,
+            text: "text".to_string(),
+        }
+    }
+
+    #[test]
+    fn test_sequence_valid_ordered_list() {
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 3.0, 5.0), seg(3, 6.0, 8.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_rejects_overlap() {
+        // Cue 2 starts before cue 1 ends: the silent-corruption case this
+        // whole change exists to surface.
+        let segments = vec![seg(1, 0.0, 5.0), seg(2, 3.0, 7.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_err());
+    }
+
+    #[test]
+    fn test_sequence_rejects_out_of_order() {
+        let segments = vec![seg(1, 10.0, 12.0), seg(2, 2.0, 4.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_err());
+    }
+
+    #[test]
+    fn test_sequence_accepts_exact_abutment() {
+        // Normal chunker output; must not be an error, or every well-formed
+        // transcript would fail.
+        let segments = vec![seg(1, 0.0, 2.5), seg(2, 2.5, 5.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_rejects_zero_length_cue() {
+        let segments = vec![seg(1, 1.0, 1.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_err());
+    }
+
+    #[test]
+    fn test_sequence_rejects_gap_below_minimum() {
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 2.05, 4.0)];
+        assert!(check_cue_sequence(&segments, Some(0.1), None).is_err());
+    }
+
+    #[test]
+    fn test_sequence_accepts_gap_meeting_minimum() {
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 2.2, 4.0)];
+        assert!(check_cue_sequence(&segments, Some(0.1), None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_rejects_duration_overrun() {
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 3.0, 12.0)];
+        assert!(check_cue_sequence(&segments, None, Some(10.0)).is_err());
+    }
+
+    #[test]
+    fn test_sequence_rejects_start_past_duration() {
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 11.0, 12.0)];
+        assert!(check_cue_sequence(&segments, None, Some(10.0)).is_err());
+    }
+
+    #[test]
+    fn test_sequence_accepts_cue_ending_exactly_at_duration() {
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 3.0, 10.0)];
+        assert!(check_cue_sequence(&segments, None, Some(10.0)).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_empty_and_single_lists_are_valid() {
+        assert!(check_cue_sequence(&[], None, None).is_ok());
+        let single = vec![seg(1, 0.0, 2.0)];
+        assert!(check_cue_sequence(&single, None, None).is_ok());
+    }
+
+    // Quantization behavior. These pin the decision to compare whole
+    // milliseconds rather than raw f64: without them, a refactor back to f64
+    // comparison would pass the suite while making exact abutment depend on
+    // whichever arithmetic produced each timestamp.
+
+    #[test]
+    fn test_sequence_abutment_survives_floating_point_arithmetic() {
+        // 0.1 * 3 is 0.30000000000000004, not 0.3. Quantized to milliseconds
+        // both are 300, so this abuts exactly and must pass.
+        let segments = vec![seg(1, 0.0, 0.1 + 0.1 + 0.1), seg(2, 0.3, 1.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_ignores_sub_millisecond_overlap() {
+        // Overlap of 0.0001s cannot be represented in a WebVTT timestamp, so
+        // it cannot affect a player and must not be reported.
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 1.9999, 4.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_rejects_cue_zero_length_only_after_quantization() {
+        // Spans 0.0001s, which serializes to a zero-length cue.
+        let segments = vec![seg(1, 1.0, 1.0001)];
+        assert!(check_cue_sequence(&segments, None, None).is_err());
+    }
+
+    #[test]
+    fn test_sequence_min_gap_zero_admits_abutting_cues() {
+        // Gap comparison is strictly less-than, so an explicit 0.0 still
+        // allows abutment.
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, 2.0, 4.0)];
+        assert!(check_cue_sequence(&segments, Some(0.0), None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_quantization_matches_written_timestamps() {
+        // The validator must agree with the write path about what a time is.
+        let boundary = 2.0004; // writes as 00:00:02.000
+        assert_eq!(to_millis(boundary), 2000);
+        assert_eq!(format_timestamp_flexible(boundary, false), "00:00:02.000");
+        let segments = vec![seg(1, 0.0, 2.0), seg(2, boundary, 4.0)];
+        assert!(check_cue_sequence(&segments, None, None).is_ok());
+    }
+
+    #[test]
+    fn test_sequence_error_message_names_both_cues_and_times() {
+        // A failure must be actionable from a log line alone, and must report
+        // the caller's own unquantized values.
+        let segments = vec![seg(7, 0.0, 5.0), seg(8, 3.0, 7.0)];
+        let err = check_cue_sequence(&segments, None, None).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains('7'), "missing previous segment id: {}", msg);
+        assert!(msg.contains('8'), "missing offending segment id: {}", msg);
+        assert!(msg.contains('3'), "missing start time: {}", msg);
+        assert!(msg.contains('5'), "missing previous end time: {}", msg);
     }
 }

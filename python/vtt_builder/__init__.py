@@ -11,6 +11,7 @@ from vtt_builder._lowlevel import (
     VttError,
     VttEscapingError,
     VttHeaderError,
+    VttSequenceError,
     VttTimestampError,
     VttValidationError,
     # Main builder functions
@@ -18,6 +19,7 @@ from vtt_builder._lowlevel import (
     build_vtt_from_json_files,
     build_vtt_from_records,
     build_vtt_string,
+    clamp_to_duration,
     detect_chapters,
     filter_by_confidence,
     filter_segments_by_time,
@@ -26,6 +28,9 @@ from vtt_builder._lowlevel import (
     group_by_speaker,
     # Segment transformation functions
     merge_segments,
+    # Parser functions
+    parse_vtt_file,
+    parse_vtt_string,
     # Podcast processing functions
     remove_filler_words,
     remove_repeated_phrases,
@@ -35,6 +40,7 @@ from vtt_builder._lowlevel import (
     split_long_segments,
     timestamp_to_seconds,
     unescape_vtt_text,
+    validate_cue_sequence,
     validate_segments,
     # Validation functions
     validate_vtt_file,
@@ -45,9 +51,12 @@ from vtt_builder._lowlevel import (
     escape_vtt_text_py as escape_vtt_text,
 )
 
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 
 __all__ = [
+    # Parser functions
+    "parse_vtt_file",
+    "parse_vtt_string",
     # Builder functions
     "build_vtt_from_records",
     "build_transcript_from_json_files",
@@ -56,11 +65,13 @@ __all__ = [
     # Validation
     "validate_vtt_file",
     "validate_segments",
+    "validate_cue_sequence",
     # Escape/Unescape
     "escape_vtt_text",
     "unescape_vtt_text",
     # Transformations
     "merge_segments",
+    "clamp_to_duration",
     "split_long_segments",
     "shift_timestamps",
     "filter_segments_by_time",
@@ -83,4 +94,5 @@ __all__ = [
     "VttHeaderError",
     "VttCueError",
     "VttEscapingError",
+    "VttSequenceError",
 ]
