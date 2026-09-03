@@ -243,11 +243,17 @@ jobs:
     name: Release to PyPI
     runs-on: ubuntu-latest
     needs: [linux, musllinux, windows, macos, sdist]
+    # Deliberately does NOT run on `release: published`. release.yml also
+    # publishes on that event, and two workflows uploading the same version
+    # race — the loser fails with "File already exists". release.yml is the
+    # single publisher for a GitHub Release; it reuses artifacts from an
+    # already-successful build here rather than rebuilding them. This job now
+    # only publishes on an explicit manual dispatch.
     if: |
       always() &&
       !cancelled() &&
       !contains(needs.*.result, 'failure') &&
-      (github.event_name == 'release' || (github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi == true))
+      github.event_name == 'workflow_dispatch' && inputs.publish_to_pypi == true
     environment:
       name: pypi
       url: https://pypi.org/project/vtt-builder/
@@ -257,6 +263,9 @@ jobs:
         with:
           pattern: wheels-*
           merge-multiple: true
+          # `uv publish` globs dist/* by default; without this the artifacts
+          # unpack into the working directory root and it finds nothing.
+          path: dist
 
       - name: List downloaded artifacts
         run: |
@@ -271,17 +280,27 @@ jobs:
           echo "Release tag: $RELEASE_TAG"
           echo "Expected version: $VERSION"
 
+          # Fail loudly if the artifacts are missing entirely, rather than
+          # letting an unmatched glob pass the loops below as a literal string.
+          shopt -s nullglob
+          wheels=(dist/*.whl)
+          tarballs=(dist/*.tar.gz)
+          if [ ${#wheels[@]} -eq 0 ] || [ ${#tarballs[@]} -eq 0 ]; then
+            echo "ERROR: expected wheels and an sdist in dist/, found ${#wheels[@]} wheel(s) and ${#tarballs[@]} sdist(s)"
+            exit 1
+          fi
+
           # Check all wheels contain the correct version
-          for wheel in *.whl; do
-            if [[ ! "$wheel" =~ vtt_builder-${VERSION}- ]]; then
+          for wheel in "${wheels[@]}"; do
+            if [[ ! "$(basename "$wheel")" =~ vtt_builder-${VERSION}- ]]; then
               echo "ERROR: Wheel $wheel does not match release version $VERSION"
               exit 1
             fi
           done
 
           # Check sdist contains the correct version
-          for tarball in *.tar.gz; do
-            if [[ ! "$tarball" =~ vtt_builder-${VERSION}\.tar\.gz ]]; then
+          for tarball in "${tarballs[@]}"; do
+            if [[ ! "$(basename "$tarball")" =~ vtt_builder-${VERSION}\.tar\.gz ]]; then
               echo "ERROR: Source distribution $tarball does not match release version $VERSION"
               exit 1
             fi
