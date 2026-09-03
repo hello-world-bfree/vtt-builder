@@ -102,23 +102,61 @@ fn escape_vtt_text(text: &str) -> String {
 
 #### 3. Validation Pipeline
 
-Validation happens at multiple levels:
+Validation happens at two levels, per-cue and cross-cue:
 
 ```
-Input Data → Segment Validation → Text Processing → Output Generation
-                    ↓
-            VttTimestampError
+Input Data → Per-cue Validation → Sequence Validation → Text Processing → Output
+                    ↓                      ↓
+            VttTimestampError       VttSequenceError
             VttCueError
 ```
 
-The validation checks:
+Per-cue checks (`validate_segment`, one `&Segment` at a time):
 - Negative timestamps
 - End time before start time
 - Empty cue text
 - Forbidden "-->" substring
 - Timestamp overflow (>99:59:59.999)
 
-#### 4. Generic Writing
+Sequence checks (`check_cue_sequence`, over the whole `&[Segment]`):
+- Start times non-decreasing
+- No overlap between adjacent cues (exact abutment is valid)
+- Zero-length cues
+- Minimum inter-cue gap (opt-in via `min_gap`)
+- Media-duration bounds (opt-in via `audio_duration`)
+
+The split is deliberate: `validate_segment` takes a single segment and has
+nowhere to hold cross-cue state, and widening the public `validate_segments` to
+mean something new would break callers who validate a list they intend to sort or
+clamp afterwards. Zero-length cues are rejected only by the sequence check —
+tightening the per-cue check would be a wider breaking change, so the stricter
+rule is scoped to the newer, opt-in-shaped surface.
+
+#### 4. Millisecond Quantization for Cue Comparison
+
+`check_cue_sequence` converts every time to `u64` milliseconds (`to_millis`) and
+compares those integers exactly. It does not compare raw `f64`, and it does not
+use an epsilon.
+
+Floating-point absolute error is proportional to the magnitude of the value
+represented, so no single epsilon can serve both a cue at `t=0.5` and one at
+`t=86400`. Milliseconds are the domain's natural grid — WebVTT serializes exactly
+three fractional digits, so any difference finer than one millisecond cannot
+appear in the output file and cannot affect a player. Integers on that grid
+compare exactly.
+
+This is also what makes the "exact abutment is valid" rule implementable: a
+chunker computing `next.start` and `prev.end` through different arithmetic can
+produce values differing in the last bits, which in raw `f64` would intermittently
+read as an overlap. `to_millis` uses the same rounding as
+`format_timestamp_flexible`, so the validator and the write path always agree
+about what a given time is.
+
+Practical consequence: the validator is marginally *more* permissive than raw
+`f64` at sub-millisecond scale, and a cue spanning less than half a millisecond
+is treated as zero-length — correctly, since it serializes as one.
+
+#### 5. Generic Writing
 
 The `write_segments_to_vtt` function uses a generic `Write` trait:
 
@@ -145,8 +183,15 @@ ValueError (Python built-in)
         ├── VttTimestampError
         ├── VttHeaderError
         ├── VttCueError
-        └── VttEscapingError
+        ├── VttEscapingError
+        └── VttSequenceError
 ```
+
+`VttSequenceError` is raised for faults in how cues relate to one another —
+ordering, overlap, inter-cue gap, media-duration bounds, zero-length cues — as
+distinct from the single-cue field faults the other types cover. It sits under
+`VttValidationError` so existing callers that catch validation errors broadly
+continue to catch it.
 
 This allows Python users to catch exceptions at the appropriate level:
 
@@ -191,22 +236,40 @@ def build_vtt_from_records(
 ```
 Python List[Dict]
        ↓
-   PyO3 Extraction
+   PyO3 Extraction  (extract_segments)
        ↓
-   Vec<Segment>
+   Vec<Segment>                          <-- complete list exists here
        ↓
-   validate_segment() [if enabled]
+   validate_segment()      [if enabled]  per-cue
        ↓
+   check_cue_sequence()    [if enabled]  cross-cue
+       ↓                                 ── nothing above touches the filesystem ──
    prepare_cue_text()
        ↓
    format_timestamp_flexible()
        ↓
-   write_vtt_header()
+   write_vtt_header()  ──┐
+       ↓                 ├── into a temp sibling file
+   write_segments_to_vtt()┘
        ↓
-   write_segments_to_vtt()
+   fs::rename()  → destination           <-- atomic publish
        ↓
    File Output (UTF-8)
 ```
+
+All validation completes **before** the destination is opened, and the write
+itself goes to a temporary sibling file that is renamed into place only once
+complete (Write-Audit-Publish). Two consequences: a rejected build leaves no
+partial file and does not disturb an existing file at the destination; and the
+destination *directory* must be writable, not just the destination path.
+
+`build_vtt_from_json_files` does not follow this flow. It streams input files one
+at a time, writing each before reading the next while advancing a running time
+offset, so it never holds the complete cue list and therefore applies per-cue
+validation only. Documenting that limit rather than half-enforcing it is
+deliberate — a sequence check with only within-file visibility would imply a
+guarantee it cannot make, and cross-file boundaries are precisely where a bad
+offset appears.
 
 ### Validating VTT Files
 
@@ -308,15 +371,33 @@ Located in `src/lib.rs` as `#[test]` functions:
 - Timestamp formatting
 - Character escaping/unescaping
 - Segment validation
+- Cue-sequence validation and millisecond quantization
+
+> **These do not currently execute.** The crate is `crate-type = ["cdylib"]` with
+> pyo3's `extension-module` feature, so `cargo test` fails at link time — there is
+> no Python interpreter to link against (`symbol(s) not found`, listing `_Py_*`).
+> `cargo clippy --all-targets` silently skips the test target for the same reason,
+> so they are not even lint-checked. Neither the `Makefile` nor CI invokes
+> `cargo test`.
+>
+> Every Rust test case is therefore mirrored in the Python suite, which is what
+> actually verifies behavior. Making them runnable would mean adding `"rlib"` to
+> `crate-type`, cfg-gating `extension-module`, or extracting the pure logic into a
+> pyo3-free inner module — a change to the crate's build shape, not yet made.
 
 ### Integration Tests (Python)
 
-Located in `tests/test_vtt_builder.py`:
+Located in `tests/test_vtt_builder.py` — **the authoritative suite** (212 tests):
 - End-to-end VTT generation
-- File I/O
-- Error handling
+- File I/O, including that a rejected build leaves no partial or temp file and
+  does not disturb an existing file at the destination
+- Error handling and exception-hierarchy behavior
+- Cue-sequence validation, and the millisecond-quantization regression cover
 - Multilingual support (Spanish, Portuguese, French, German, Italian, Polish)
 - Edge cases
+
+Run against the full supported range with `uv run --python <version> pytest`; CI
+covers 3.9 through 3.14.
 
 ### Test Categories
 
