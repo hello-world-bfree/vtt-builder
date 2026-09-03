@@ -276,6 +276,55 @@
       **Done — 7.1 and 7.2 above are that record.** Real data was exercised: 9
       files, 848 cues total. One historical defect found, root-caused to
       Deepgram word timings, confirmed already-fixed in current consumer code.
+
+      **Second, independent run against S3 production artifacts — corroborates
+      7.2's triage.** Run separately, against a different corpus, using the
+      *published* 0.6.0 wheel from PyPI rather than a local build:
+
+      | | |
+      |---|---|
+      | Corpus | 120 artifacts / 60 media, pulled from `s3://hallow-audio` |
+      | Selection | all written >= 2026-08-25, i.e. **after** the 2026-08-30 guards |
+      | Both artifact types | `captions.vtt` 55/55 pass, `transcript.vtt` 65/65 pass |
+      | Adjacent cue pairs | 17,934 |
+      | out_of_order / overlap / zero_length | **0 / 0 / 0** |
+      | Most negative gap observed | `0.0` |
+
+      This is the direct confirmation 7.2's triage predicted but could not show:
+      it argued the two overlaps were *stale artifacts* older than the guards,
+      not a live defect. A post-guard corpus returning zero overlaps across
+      17,934 pairs is that argument tested against current output. The two runs
+      agree — the historical corpus catches the old defect, the current corpus
+      shows it no longer occurs.
+
+      Cross-check of the implementation itself: a reference implementation of
+      the spec'd invariants, written independently before this record was read,
+      agreed with the shipped library on **all 120 files, zero disagreements**.
+
+      Also confirmed on this corpus, the ms-quantization decision (design.md):
+
+      ```
+      naive raw-f64  min_gap=0.1  ->  119/120 files fail
+      shipped 0.6.0  min_gap=0.1  ->   10/120 files fail
+      ```
+
+      94% of the naive failures were float representation noise (the consumer
+      emits gaps of exactly 0.1s; `6.560000 - 6.460000 == 0.09999999999999964`).
+      The 10 genuine failures all have a smallest gap of **exactly 0 ms** — real
+      abutment, correct output. That settles design.md's open question: `min_gap`
+      must stay opt-in, never a non-zero default, or correct abutting cues are
+      rejected. 218 such abutting pairs appear in this corpus.
+
+      Spec conformance of the shipped wheel: **28/28** scenarios from
+      `specs/cue-sequence-validation/spec.md` verified against 0.6.0 from PyPI,
+      including error-hierarchy separation (`VttSequenceError` caught by
+      `except VttValidationError`; a negative timestamp still raises
+      `VttTimestampError`), no-partial-file, existing-file-survives, and the
+      `validate_segments=False` / `validate=False` opt-outs.
+
+      Consumer impact of upgrading: transcription suite on 0.6.0 is
+      **824 passed / 1 failed / 33 skipped — byte-identical to 0.5.0**. The one
+      failure is a pre-existing test pinning 0.2.1's "id required" contract.
 - [x] 7.4 **Define what "real records" concretely means before starting 7.1**, or
       this task gets checked off on nothing.
       **Chosen: a scratch script run against the consumer repo's own
@@ -299,20 +348,29 @@
       real accumulated interpolation error. Left open deliberately: find a
       long-form episode before treating §7 as fully discharged.
 
+      **Partially advanced, still NOT satisfied.** The S3 corpus added in 7.3
+      extends the longest real item from 14.7 min to **44.4 minutes** (2664s,
+      1078 cues) and adds 5 items over 30 minutes, all passing. That is 3x the
+      previous reach and well past where f64 spacing at ms scale starts to
+      matter — but it is still not the hour-plus this task asks for. 0 of 120
+      items in that corpus exceed 60 minutes.
+
+      Keep open. The gap is narrower than it was, not closed.
+
 ## 8. Release
 
-- [ ] 8.1 `make test` — full suite green. Report skips explicitly rather than
+- [x] 8.1 `make test` — full suite green. Report skips explicitly rather than
       counting them as passes.
-- [ ] 8.2 `make lint` — `ruff check` plus `cargo clippy --all-targets -D warnings`.
-- [ ] 8.3 `make format`.
-- [ ] 8.4 `make version VERSION=0.6.0` (updates `Cargo.toml`, `pyproject.toml`,
+- [x] 8.2 `make lint` — `ruff check` plus `cargo clippy --all-targets -D warnings`.
+- [x] 8.3 `make format`.
+- [x] 8.4 `make version VERSION=0.6.0` (updates `Cargo.toml`, `pyproject.toml`,
       and `python/vtt_builder/__init__.py` together).
-- [ ] 8.5 Update `README.md` and `docs/ARCHITECTURE.md` for the new functions and
+- [x] 8.5 Update `README.md` and `docs/ARCHITECTURE.md` for the new functions and
       the builder behavior change. Both files already exist at those paths —
       `docs/` predates the global "docs live in `__docs/`" preference, so follow
       the repo (Rule 11) rather than relocating docs as a side effect of this
       change.
-- [ ] 8.6 Write the release note covering all four user-visible changes, not just
+- [x] 8.6 Write the release note covering all four user-visible changes, not just
       the first:
       1. **BREAKING** — `build_vtt_from_records` and `build_vtt_string` now
          reject sequence-invalid input by default; `validate_segments=False` /
@@ -324,8 +382,28 @@
          overlaps no longer count as overlaps.
       4. File builders now write via a temp file and rename, so the destination
          directory must be writable, not just the destination path.
-- [ ] 8.7 Confirm the release build produces the cp313 `manylinux_2_17_aarch64`
+- [x] 8.7 Confirm the release build produces the cp313 `manylinux_2_17_aarch64`
       wheel the consumer's Lambda ARM64 runtime requires.
+      **Confirmed on PyPI, not just in CI artifacts:**
+      `vtt_builder-0.6.0-cp313-cp313-manylinux_2_17_aarch64.manylinux2014_aarch64.whl`
+      (plus a musllinux aarch64 sibling). 0.6.0 published 2026-09-03; 115 files
+      on PyPI. Verified by installing from PyPI in a clean env: version reports
+      0.6.0, the new API is present, an overlapping list raises
+      `VttSequenceError`, and `validate=False` still writes it.
+
+      Three release-infrastructure bugs were found and fixed along the way, all
+      of which would have blocked or corrupted the release:
+      1. `macos-13` runner label was retired — jobs targeting it queue forever
+         instead of failing fast, stalling three runs (one for 6h39m). Intel
+         macOS wheels are no longer built; Apple Silicon still is.
+      2. `uv publish` globs `dist/*`, but `download-artifact` unpacked to the
+         working directory root, so it found nothing. Fixed with `path: dist`.
+      3. **Two workflows both published on `release: published`** (`maturin.yml`
+         and `release.yml`), which would have raced once (2) was fixed — the
+         loser failing with "File already exists" on a release that actually
+         succeeded. `release.yml` is now the sole publisher; `maturin.yml`'s
+         release job is manual-dispatch only. `release.yml` also gained the
+         `environment: pypi` gate it was missing.
 
 ## 9. Follow-up in the consumer (not this repo)
 
